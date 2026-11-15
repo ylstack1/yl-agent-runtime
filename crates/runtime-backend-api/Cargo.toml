@@ -1,0 +1,21 @@
+[package]
+name = "runtime-backend-api"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "YL Agent Runtime backend API - stable trait boundary for execution backends"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"
+runtime-core = { path = "../runtime-core" }
+runtime-policy = { path = "../runtime-policy" }
+runtime-process = { path = "../runtime-process" }

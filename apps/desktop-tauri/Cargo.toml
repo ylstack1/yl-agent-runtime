@@ -1,0 +1,31 @@
+[package]
+name = "desktop-tauri"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "YL Agent Runtime desktop control center - Tauri 2 tray application"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tauri = { workspace = true, features = ["tray-icon", "cli"] }
+tauri-plugin-shell = { workspace = true }
+tauri-plugin-fs = { workspace = true }
+tauri-plugin-dialog = { workspace = true }
+tauri-plugin-opener = { workspace = true }
+tauri-plugin-notification = { workspace = true }
+runtime-core = { path = "../../crates/runtime-core" }
+runtime-daemon = { path = "../../crates/runtime-daemon" }
+runtime-cli = { path = "../../crates/runtime-cli" }
+runtime-config = { path = "../../crates/runtime-config" }
+runtime-policy = { path = "../../crates/runtime-policy" }
+runtime-identity = { path = "../../crates/runtime-identity" }
+runtime-approval = { path = "../../crates/runtime-approval" }
+runtime-workspace = { path = "../../crates/runtime-workspace" }
+runtime-process = { path = "../../crates/runtime-process" }
+runtime-terminal = { path = "../../crates/runtime-terminal" }
+runtime-audit = { path = "../../crates/runtime-audit" }

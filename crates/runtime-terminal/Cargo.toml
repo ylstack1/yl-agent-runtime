@@ -1,0 +1,36 @@
+[package]
+name = "runtime-terminal"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "YL Agent Runtime terminal service - interactive PTY/ConPTY sessions"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+portable-pty = { workspace = true }
+async-trait = "0.1"
+runtime-core = { path = "../runtime-core" }
+runtime-process = { path = "../runtime-process" }
+runtime-policy = { path = "../runtime-policy" }
+runtime-audit = { path = "../runtime-audit" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+conpty = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { workspace = true }
+libc = { workspace = true }

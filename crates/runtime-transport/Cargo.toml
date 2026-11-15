@@ -1,0 +1,28 @@
+[package]
+name = "runtime-transport"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "YL Agent Runtime transport service - local IPC and optional remote connectivity"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+iroh = { workspace = true, optional = true }
+runtime-core = { path = "../runtime-core" }
+runtime-identity = { path = "../runtime-identity" }
+runtime-policy = { path = "../runtime-policy" }
+runtime-audit = { path = "../runtime-audit" }
+
+[features]
+default = []
+iroh = ["iroh"]

@@ -1,0 +1,22 @@
+[package]
+name = "runtime-policy"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "YL Agent Runtime policy engine - capabilities, profiles, enforcement"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+figment = { workspace = true }
+toml = { workspace = true }
+async-trait = "0.1"
+runtime-core = { path = "../runtime-core" }
+runtime-identity = { path = "../runtime-identity" }
+runtime-config = { path = "../runtime-config" }

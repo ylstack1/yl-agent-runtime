@@ -1,0 +1,25 @@
+[package]
+name = "backend-virtx"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "YL Agent Runtime Virtx VM backend - disposable VM isolation for hostile workloads"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+runtime-core = { path = "../runtime-core" }
+runtime-policy = { path = "../runtime-policy" }
+runtime-process = { path = "../runtime-process" }
+runtime-backend-api = { path = "../runtime-backend-api" }
+backend-native = { path = "../backend-native" }
+
+# Note: Virtx dependency to be added after host requirements and license verification
+# virtx = { git = "https://github.com/brekkylab/virtx", rev = "..." }

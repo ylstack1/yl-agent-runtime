@@ -1,0 +1,23 @@
+[package]
+name = "runtime-approval"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "YL Agent Runtime approval broker - user consent for sensitive operations"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"
+runtime-core = { path = "../runtime-core" }
+runtime-policy = { path = "../runtime-policy" }
+runtime-identity = { path = "../runtime-identity" }
+runtime-audit = { path = "../runtime-audit" }
+runtime-transport = { path = "../runtime-transport" }

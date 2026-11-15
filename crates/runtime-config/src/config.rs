@@ -1,0 +1,205 @@
+//! Runtime configuration
+
+use runtime_core::error::{Error, Result};
+use runtime_core::types::*;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::collections::HashMap;
+
+/// Runtime configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub version: String,
+    pub data_dir: PathBuf,
+    pub config_dir: PathBuf,
+    pub log_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub daemon: DaemonConfig,
+    pub policy: PolicyConfig,
+    pub audit: AuditConfig,
+    pub backend: BackendConfig,
+    pub transport: TransportConfig,
+    pub remote: RemoteConfig,
+}
+
+/// Daemon configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    pub bind_address: String,
+    pub port: u16,
+    pub idle_timeout_seconds: u64,
+    pub max_sessions: u32,
+    pub startup_timeout_seconds: u64,
+}
+
+/// Policy configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyConfig {
+    pub default_profile: ExecutionProfile,
+    pub policy_dir: PathBuf,
+    pub fail_closed: bool,
+    pub require_approval_for: Vec<Capability>,
+}
+
+/// Audit configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    pub enabled: bool,
+    pub retention_days: u32,
+    pub max_log_size_mb: u64,
+    pub export_format: String,
+    pub redact_secrets: bool,
+}
+
+/// Backend configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendConfig {
+    pub preferred_backend: String,
+    pub enable_native: bool,
+    pub enable_windows_sandbox: bool,
+    pub enable_linux_sandbox: bool,
+    pub enable_macos_sandbox: bool,
+    pub enable_arapuca: bool,
+    pub enable_virtx: bool,
+}
+
+/// Transport configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportConfig {
+    pub enable_stdio: bool,
+    pub enable_streamable_http: bool,
+    pub http_bind_address: String,
+    pub http_port: u16,
+    pub enable_iroh: bool,
+}
+
+/// Remote configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    pub enabled: bool,
+    pub pairing_required: bool,
+    pub session_timeout_seconds: u64,
+    pub rate_limit_per_minute: u32,
+    pub max_request_size_mb: u64,
+}
+
+impl Config {
+    pub fn default() -> Self {
+        Self {
+            version: "0.1.0".to_string(),
+            data_dir: PathBuf::from("./data"),
+            config_dir: PathBuf::from("./config"),
+            log_dir: PathBuf::from("./logs"),
+            cache_dir: PathBuf::from("./cache"),
+            daemon: DaemonConfig {
+                bind_address: "127.0.0.1".to_string(),
+                port: 0, // Use IPC/named pipe by default
+                idle_timeout_seconds: 3600,
+                max_sessions: 100,
+                startup_timeout_seconds: 5,
+            },
+            policy: PolicyConfig {
+                default_profile: ExecutionProfile::Development,
+                policy_dir: PathBuf::from("./config/policies"),
+                fail_closed: true,
+                require_approval_for: vec![
+                    Capability::ProcessExec,
+                    Capability::TerminalOpen,
+                    Capability::GitCommit,
+                    Capability::SystemElevate,
+                ],
+            },
+            audit: AuditConfig {
+                enabled: true,
+                retention_days: 90,
+                max_log_size_mb: 100,
+                export_format: "jsonl".to_string(),
+                redact_secrets: true,
+            },
+            backend: BackendConfig {
+                preferred_backend: "native".to_string(),
+                enable_native: true,
+                enable_windows_sandbox: true,
+                enable_linux_sandbox: true,
+                enable_macos_sandbox: true,
+                enable_arapuca: false, // Disabled until Phase 0 verification
+                enable_virtx: false,   // Disabled until Phase 5
+            },
+            transport: TransportConfig {
+                enable_stdio: true,
+                enable_streamable_http: false,
+                http_bind_address: "127.0.0.1".to_string(),
+                http_port: 0,
+                enable_iroh: false,
+            },
+            remote: RemoteConfig {
+                enabled: false,
+                pairing_required: true,
+                session_timeout_seconds: 3600,
+                rate_limit_per_minute: 100,
+                max_request_size_mb: 10,
+            },
+        }
+    }
+
+    pub fn load_from_file(path: &PathBuf) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| Error::Config(format!("Failed to read config file: {}", e)))?;
+        let config: Config = toml::from_str(&content)
+            .map_err(|e| Error::Config(format!("Failed to parse config: {}", e)))?;
+        Ok(config)
+    }
+
+    pub fn save_to_file(&self, path: &PathBuf) -> Result<()> {
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| Error::Config(format!("Failed to serialize config: {}", e)))?;
+        std::fs::write(path, content).map_err(|e| Error::Config(format!("Failed to write config: {}", e)))?;
+        Ok(())
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::default()
+    }
+}
+
+/// Configuration migration result
+#[derive(Debug, Clone)]
+pub struct MigrationResult {
+    pub from_version: String,
+    pub to_version: String,
+    pub migrated: bool,
+}
+
+/// Configuration migrator
+pub struct ConfigMigrator;
+
+impl ConfigMigrator {
+    pub fn migrate(config: Config, target_version: &str) -> Result<(Config, MigrationResult)> {
+        if config.version == target_version {
+            return Ok((config, MigrationResult {
+                from_version: config.version.clone(),
+                to_version: target_version.to_string(),
+                migrated: false,
+            }));
+        }
+
+        // Perform migrations
+        let mut config = config;
+        let mut migrated = false;
+
+        // Example migration: add new fields
+        if config.version < "0.2.0" {
+            // Add any new fields introduced in 0.2.0
+            migrated = true;
+            config.version = "0.2.0".to_string();
+        }
+
+        Ok((config, MigrationResult {
+            from_version: config.version.clone(),
+            to_version: target_version.to_string(),
+            migrated,
+        }))
+    }
+}

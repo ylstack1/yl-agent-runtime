@@ -1,0 +1,27 @@
+[package]
+name = "backend-linux"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "YL Agent Runtime Linux sandbox backend - Landlock, seccomp, namespaces, cgroups"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+landlock = { workspace = true }
+seccomp = { workspace = true }
+cgroups = { workspace = true }
+runtime-core = { path = "../runtime-core" }
+runtime-policy = { path = "../runtime-policy" }
+runtime-process = { path = "../runtime-process" }
+runtime-backend-api = { path = "../runtime-backend-api" }
+backend-native = { path = "../backend-native" }

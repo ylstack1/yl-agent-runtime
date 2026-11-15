@@ -1,0 +1,32 @@
+[package]
+name = "runtime-toolchain"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "YL Agent Runtime toolchain discovery - discovers installed development tools"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+which = "6.0"
+runtime-core = { path = "../runtime-core" }
+runtime-policy = { path = "../runtime-policy" }
+runtime-workspace = { path = "../runtime-workspace" }
+runtime-audit = { path = "../runtime-audit" }
+
+[target.'cfg(windows)'.dependencies]
+winreg = { workspace = true }
+windows = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+which = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+which = { workspace = true }

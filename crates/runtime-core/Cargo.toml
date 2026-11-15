@@ -1,0 +1,24 @@
+[package]
+name = "runtime-core"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "Core types, traits, and error handling for YL Agent Runtime"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+target-lexicon = { workspace = true }
+async-trait = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

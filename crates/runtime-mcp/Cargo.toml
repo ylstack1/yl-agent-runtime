@@ -1,0 +1,30 @@
+[package]
+name = "runtime-mcp"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "YL Agent Runtime MCP adapter - exposes tools and resources to agents"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+rmcp = { workspace = true }
+schemars = "0.8"
+async-trait = "0.1"
+runtime-core = { path = "../runtime-core" }
+runtime-protocol = { path = "../runtime-protocol" }
+runtime-policy = { path = "../runtime-policy" }
+runtime-workspace = { path = "../runtime-workspace" }
+runtime-process = { path = "../runtime-process" }
+runtime-terminal = { path = "../runtime-terminal" }
+runtime-toolchain = { path = "../runtime-toolchain" }
+runtime-identity = { path = "../runtime-identity" }
+runtime-approval = { path = "../runtime-approval" }
+runtime-audit = { path = "../runtime-audit" }

@@ -1,0 +1,32 @@
+# Rust
+/target/
+/Cargo.lock
+
+# Project data and state directories (PRD section 16)
+/config/
+/state/
+/cache/
+/logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary
+*.tmp
+*.bak
+
+# Tauri
+apps/desktop-tauri/target/
+apps/desktop-tauri/src-tauri/target/

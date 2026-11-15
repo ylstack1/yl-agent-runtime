@@ -1,0 +1,25 @@
+[package]
+name = "runtime-cli"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "YL Agent Runtime CLI - diagnostics, pairing, administration"
+
+[[bin]]
+name = "yl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+runtime-core = { path = "../runtime-core" }
+runtime-config = { path = "../runtime-config" }
+runtime-identity = { path = "../runtime-identity" }
+runtime-daemon = { path = "../runtime-daemon" }

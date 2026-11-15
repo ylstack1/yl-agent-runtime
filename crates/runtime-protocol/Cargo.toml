@@ -1,0 +1,18 @@
+[package]
+name = "runtime-protocol"
+version = { workspace = true }
+edition = "2021"
+license = { workspace = true }
+repository = { workspace = true }
+description = "YL Agent Runtime protocol definitions - MCP tools, resources, messages"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+schemars = "0.8"
+rmcp = { workspace = true }
+runtime-core = { path = "../runtime-core" }
