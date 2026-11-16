@@ -38,17 +38,6 @@ pub struct EditOutcome {
 const EDIT_DIFF_CAP: usize = 20_480;
 const EDIT_DIFF_TRUNCATED: &str = "\n... diff truncated";
 
-/// Stage-2 fallback result.
-enum Stage2 {
-    /// Exactly one trimmed window matched; `content` was already replaced.
-    Replaced,
-    /// `k` trimmed windows matched; `starts` holds their 0-based start lines
-    /// (up to 5 are reported in the error).
-    Multiple(Vec<usize>),
-    /// No trimmed window matched.
-    None,
-}
-
 /// Edit `path` applying every edit in `edits` in order against the evolving
 /// in-memory content. The file is written exactly once, and only when every
 /// edit applies cleanly; any failure returns an error and leaves the file
@@ -156,17 +145,17 @@ fn stage2_replace(
     let new_lines: Vec<&str> = new.split('\n').collect();
     let content_lines: Vec<&str> = content.split('\n').collect();
 
-    let L = old_lines.len();
-    if L == 0 {
+    let len = old_lines.len();
+    if len == 0 {
         return Err(closest_match_error(edit_no, total, &[], content_lines.as_slice()));
     }
 
     let mut windows: Vec<usize> = Vec::new();
-    for s in 0..=content_lines.len().saturating_sub(L) {
-        if old_ends_nl && s + L == content_lines.len() {
+    for s in 0..=content_lines.len().saturating_sub(len) {
+        if old_ends_nl && s + len == content_lines.len() {
             continue; // `old` expected a newline after the match; the file has none there
         }
-        if (0..L).all(|j| content_lines[s + j].trim() == old_lines[j].trim()) {
+        if (0..len).all(|j| content_lines[s + j].trim() == old_lines[j].trim()) {
             windows.push(s);
         }
     }
@@ -182,7 +171,7 @@ fn stage2_replace(
             *content = replace_window(
                 &content,
                 windows[0],
-                L,
+                len,
                 content_lines,
                 new_lines.as_slice(),
                 old_lines.as_slice(),
@@ -196,13 +185,13 @@ fn stage2_replace(
     }
 }
 
-/// Replace the window at line `s` (length `L`) with `new_lines`, re-indenting
+/// Replace the window at line `s` (length `len`) with `new_lines`, re-indenting
 /// each replacement line by `indent(file_line) + indent(new_line) -
 /// indent(old_line)` clamped at 0 spaces (tabs count as 4-space units).
 fn replace_window(
     content: &str,
     s: usize,
-    L: usize,
+    len: usize,
     content_lines: Vec<&str>,
     new_lines: &[&str],
     old_lines: &[&str],
@@ -216,7 +205,7 @@ fn replace_window(
         let width = width.max(0);
         out.push(format!("{}{}", " ".repeat(width), nl.trim_start()));
     }
-    out.extend(content_lines[s + L..].iter().map(|l| (*l).to_string()));
+    out.extend(content_lines[s + len..].iter().map(|l| (*l).to_string()));
     out.join("\n")
 }
 
@@ -224,12 +213,12 @@ fn replace_window(
 /// per-line bigram-Dice similarity with all whitespace removed; the earliest
 /// best start wins.
 fn closest_match_error(edit_no: usize, total: usize, old_lines: &[&str], file_lines: &[&str]) -> Error {
-    let L = old_lines.len();
+    let len = old_lines.len();
     let mut best_start = 0usize;
     let mut best_sim = f64::NEG_INFINITY;
-    if L > 0 && L <= file_lines.len() {
-        for s in 0..=file_lines.len() - L {
-            let sim: f64 = (0..L)
+    if len > 0 && len <= file_lines.len() {
+        for s in 0..=file_lines.len() - len {
+            let sim: f64 = (0..len)
                 .map(|j| {
                     bigram_dice(
                         &strip_whitespace(old_lines[j]),
@@ -245,9 +234,9 @@ fn closest_match_error(edit_no: usize, total: usize, old_lines: &[&str], file_li
     }
 
     let s_1 = best_start + 1;
-    let e_1 = best_start + L;
+    let e_1 = best_start + len;
     let region_start = best_start.saturating_sub(2);
-    let region_end = (best_start + L + 2).min(file_lines.len());
+    let region_end = (best_start + len + 2).min(file_lines.len());
     let mut region = String::new();
     let mut shown = 0usize;
     for (idx, line) in file_lines[region_start..region_end].iter().enumerate() {
@@ -265,8 +254,8 @@ fn closest_match_error(edit_no: usize, total: usize, old_lines: &[&str], file_li
     }
 
     Error::Validation(format!(
-        "Could not find exact match for edit {edit_no} of {total}.\
-         old_text must match the file's text exactly; only line endings and leading/trailing whitespace may differ.\
+        "Could not find exact match for edit {edit_no} of {total}.\n\
+         old_text must match the file's text exactly; only line endings and leading/trailing whitespace may differ.\n\
          old_text:\n{old}closest region (lines {s_1}..{e_1}):\n{region}Retry with old_text copied exactly from the file."
     ))
 }
