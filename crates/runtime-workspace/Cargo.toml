@@ -31,3 +31,15 @@ base64 = { workspace = true }
 runtime-core = { path = "../runtime-core" }
 runtime-policy = { path = "../runtime-policy" }
 runtime-audit = { path = "../runtime-audit" }
+
+# Test-only: privilege-free NTFS junction creation for the realpath re-containment
+# test (symlink_dir requires Developer Mode/admin; junctions do not).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_SystemServices",
+] }
+

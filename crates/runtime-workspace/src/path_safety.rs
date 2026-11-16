@@ -7,7 +7,9 @@
 use runtime_core::error::{Error, Result};
 use runtime_core::types::ProjectId;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 /// A validated, contained workspace path
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +17,18 @@ pub struct ContainedPath {
     pub project_id: ProjectId,
     pub absolute_path: PathBuf,
     pub relative_path: PathBuf,
+}
+
+/// How a validated path is about to be used.
+///
+/// `Write` and `Move` refuse paths inside any read-only root; `Read` allows
+/// them. `validate()` delegates with `AccessMode::Read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessMode {
+    Read,
+    Write,
+    Move,
 }
 
 /// Path validation result
@@ -70,6 +84,7 @@ const SENSITIVE_DIRS: &[&str] = &[
 #[derive(Clone)]
 pub struct PathValidator {
     allowed_roots: Vec<PathBuf>,
+    read_only_roots: Vec<PathBuf>,
     deny_paths: Vec<PathBuf>,
     follow_symlinks: bool,
     max_depth: usize,
@@ -80,6 +95,7 @@ impl PathValidator {
     pub fn new() -> Self {
         Self {
             allowed_roots: Vec::new(),
+            read_only_roots: Vec::new(),
             deny_paths: Vec::new(),
             follow_symlinks: false,
             max_depth: 256,
@@ -89,6 +105,12 @@ impl PathValidator {
 
     pub fn with_root(mut self, root: PathBuf) -> Self {
         self.allowed_roots.push(root);
+        self
+    }
+
+    /// Register a root that must never be written to (only read from).
+    pub fn with_read_only_root(mut self, root: PathBuf) -> Self {
+        self.read_only_roots.push(root);
         self
     }
 
@@ -102,50 +124,91 @@ impl PathValidator {
         self
     }
 
-    /// Validate and resolve a path within allowed roots
+    /// Validate and resolve a path for read access within allowed roots.
     pub fn validate(&self, project_id: ProjectId, user_path: &Path) -> Result<ContainedPath> {
-        let mut violations = Vec::new();
+        self.validate_access(project_id, user_path, AccessMode::Read)
+    }
 
-        // Reject null bytes
-        if user_path.to_string_lossy().contains('\0') {
+    /// Full pipeline: `..`-collapse (drive prefix retained) → ADS/reserved/trailing
+    /// checks → Windows drive normalization → root containment → canonicalize
+    /// (realpath) → re-containment → deny/read-only enforcement.
+    ///
+    /// No home-directory expansion is performed (`~` stays a literal component,
+    /// harmless inside a root); the ADS colon check runs before containment.
+    /// Write/Move refuse paths inside any read-only root.
+    pub fn validate_access(
+        &self,
+        project_id: ProjectId,
+        user_path: &Path,
+        mode: AccessMode,
+    ) -> Result<ContainedPath> {
+        let mut violations = Vec::new();
+        let raw = user_path.to_string_lossy().to_string();
+
+        // (1) Null byte check (existing behavior).
+        if raw.contains('\0') {
             violations.push(PathViolation::NullByte);
             return Err(Error::PathEscape(format!("Null byte in path: {:?}", user_path)));
         }
 
-        // Reject Windows device names
-        #[cfg(windows)]
-        {
-            if let Some(file_name) = user_path.file_name().and_then(|n| n.to_str()) {
-                let upper = file_name.to_uppercase();
-                if WINDOWS_DEVICE_NAMES.iter().any(|&d| upper == d) {
-                    violations.push(PathViolation::DeviceNamespace);
-                    return Err(Error::PathNotAllowed(format!(
-                        "Windows device name not allowed: {}",
-                        file_name
-                    )));
-                }
-            }
-        }
-
-        // Reject UNC paths unless explicitly allowed
-        if user_path.starts_with("\\\\") || user_path.starts_with("//") {
+        // UNC / device-namespace heads are rejected unconditionally. The check is
+        // string-based on purpose: `Path::starts_with` compares components, so a
+        // verbatim-free `\\server\share` head could slip through when parsed as a
+        // Windows prefix.
+        if raw.starts_with("\\\\") || raw.starts_with("//") {
             violations.push(PathViolation::UncPath);
             return Err(Error::PathNotAllowed("UNC paths not allowed".to_string()));
         }
 
-        // Reject alternate data streams (Windows)
-        #[cfg(windows)]
-        {
-            if user_path.to_string_lossy().contains(":$") {
+        // (2) Raw-component checks. These run on the raw string because Windows path
+        // parsing silently trims trailing dots/spaces, which would hide `file.`
+        // (Win32 strips them) and could absorb stray colons afterwards.
+        //
+        // (brief step 3) ADS / stray drive colon: a ':' is only legal as the drive
+        // prefix (`^[A-Za-z]:`). This must run before root containment.
+        for (idx, component) in split_path_components(&raw).into_iter().enumerate() {
+            if component.contains(':') && !is_drive_prefix_component(component, idx) {
                 violations.push(PathViolation::AlternateDataStream);
-                return Err(Error::PathNotAllowed("Alternate data streams not allowed".to_string()));
+                return Err(Error::PathNotAllowed(format!(
+                    "Alternate data streams / stray drive colon not allowed: {:?}",
+                    user_path
+                )));
+            }
+        }
+        // (brief steps 4 + 5) reserved device names per component (incl. `CON.txt`)
+        // and trailing dot/space components.
+        for component in split_path_components(&raw) {
+            if component == "." || component == ".." {
+                continue; // navigation, handled by normalization/traversal check
+            }
+            if is_windows_device_component(component) {
+                violations.push(PathViolation::DeviceNamespace);
+                return Err(Error::PathNotAllowed(format!(
+                    "Windows device name not allowed: {}",
+                    component
+                )));
+            }
+            if component.ends_with('.') || component.ends_with(' ') {
+                violations.push(PathViolation::InvalidComponent);
+                return Err(Error::PathNotAllowed(format!(
+                    "Invalid component (Win32 strips trailing dot/space): {:?}",
+                    component
+                )));
             }
         }
 
-        // Normalize the path
-        let normalized = normalize_path(user_path);
+        // (brief step 6) drive normalization on Windows before containment.
+        #[cfg(windows)]
+        let raw2 = normalize_windows_path(&raw);
+        #[cfg(not(windows))]
+        let raw2 = raw.clone();
 
-        // Check for path traversal after normalization
+        // (brief step 2) `..`-collapse normalization, retaining the Windows drive
+        // prefix and root separator (absolute inputs stay absolute).
+        let normalized = normalize_path(Path::new(&raw2));
+
+        // Path traversal after normalization (existing behavior; leading `..`
+        // components are preserved by normalization so they are visible here).
         let normalized_str = normalized.to_string_lossy();
         if normalized_str.starts_with("..")
             || normalized_str.contains("/..")
@@ -155,49 +218,50 @@ impl PathValidator {
             return Err(Error::PathEscape(format!("Path traversal detected: {:?}", user_path)));
         }
 
-        // Resolve against allowed roots
-        let resolved = self.resolve_against_roots(project_id, &normalized)?;
+        // (brief step 7) root containment, separator-boundary safe, remembering
+        // which root matched for re-containment.
+        let (resolved, matched_root) = self.resolve_against_roots(project_id, &normalized)?;
 
-        // Check deny paths
-        for deny in &self.deny_paths {
-            if resolved.starts_with(deny) {
-                violations.push(PathViolation::SensitiveDirectory);
-                return Err(Error::PathNotAllowed(format!(
-                    "Path is in denied directory: {:?}",
-                    resolved
-                )));
-            }
-        }
+        // Deny lists + sensitive directories (existing behavior, pre-canonical).
+        self.check_deny_and_sensitive(&resolved, &mut violations)?;
 
-        // Check sensitive directories
-        for sensitive in SENSITIVE_DIRS {
-            let sensitive_path = Path::new(sensitive);
-            if resolved.starts_with(sensitive_path) {
-                violations.push(PathViolation::SensitiveDirectory);
-                return Err(Error::PathNotAllowed(format!(
-                    "Path is in sensitive directory: {:?}",
-                    resolved
-                )));
-            }
-        }
-
-        // Validate depth
+        // Depth (existing behavior).
         let depth = resolved.components().count();
         if depth > self.max_depth {
             violations.push(PathViolation::OutsideAllowedRoot);
             return Err(Error::Validation(format!("Path depth {} exceeds maximum {}", depth, self.max_depth)));
         }
 
-        // Find which root this resolved path is under
-        let relative_path = self
-            .allowed_roots
-            .iter()
-            .find_map(|root| resolved.strip_prefix(root).ok().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| resolved.clone());
+        // Relative path is stable regardless of canonicalization below.
+        let relative_path = resolved
+            .strip_prefix(&matched_root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| resolved.clone());
+
+        // (brief step 8) realpath re-containment: junctions/symlinks that leave the
+        // roots fail with PathEscape; ENOENT (new file) falls back to the deepest
+        // existing ancestor so intermediate junctions are still caught.
+        let final_path = self.recontain_via_realpath(&resolved)?;
+
+        // (brief step 9) deny lists + read-only roots on the final path; denies
+        // apply to every mode, read-only roots only refuse Write/Move.
+        self.check_deny_and_sensitive(&final_path, &mut violations)?;
+        if matches!(mode, AccessMode::Write | AccessMode::Move) {
+            let ro_hit = self
+                .read_only_roots
+                .iter()
+                .find(|root| final_path.starts_with(*root) || resolved.starts_with(*root));
+            if let Some(root) = ro_hit {
+                return Err(Error::PathNotAllowed(format!(
+                    "Path is in a read-only root: {}",
+                    root.display()
+                )));
+            }
+        }
 
         Ok(ContainedPath {
             project_id,
-            absolute_path: resolved.clone(),
+            absolute_path: final_path,
             relative_path,
         })
     }
@@ -217,11 +281,96 @@ impl PathValidator {
         self.allowed_roots.retain(|r| r != root);
     }
 
-    fn resolve_against_roots(&self, project_id: ProjectId, path: &Path) -> Result<PathBuf> {
-        // If path is already absolute and within a root, use it directly
+    /// Deny lists and sensitive directories, applied to both the pre-canonical
+    /// and the canonical (realpath) form so a junction cannot launder a target.
+    fn check_deny_and_sensitive(&self, resolved: &Path, violations: &mut Vec<PathViolation>) -> Result<()> {
+        for deny in &self.deny_paths {
+            if resolved.starts_with(deny) {
+                violations.push(PathViolation::SensitiveDirectory);
+                return Err(Error::PathNotAllowed(format!(
+                    "Path is in denied directory: {:?}",
+                    resolved
+                )));
+            }
+        }
+
+        for sensitive in SENSITIVE_DIRS {
+            let sensitive_path = Path::new(sensitive);
+            if resolved.starts_with(sensitive_path) {
+                violations.push(PathViolation::SensitiveDirectory);
+                return Err(Error::PathNotAllowed(format!(
+                    "Path is in sensitive directory: {:?}",
+                    resolved
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Canonicalize the contained path and enforce containment a second time so
+    /// junctions/symlinks inside a root cannot escape it.
+    ///
+    /// ENOENT (new file) is tolerated: the deepest existing *ancestor* is
+    /// canonicalized instead, so an intermediate junction is still caught. If
+    /// nothing below the roots can be canonicalized at all (no root exists on
+    /// disk, e.g. synthetic test roots), the pre-canonical resolved path is used
+    /// — its textual containment already held. Any other canonicalize error fails
+    /// closed with `Error::Io` rather than silently passing.
+    fn recontain_via_realpath(&self, resolved: &Path) -> Result<PathBuf> {
+        // Compare realpaths against canonicalized roots: on Windows `canonicalize`
+        // returns verbatim `\\?\` paths and resolves 8.3 short names, so the raw
+        // registered roots cannot be prefix-matched against the canonical target.
+        let canonical_roots: Vec<PathBuf> = self
+            .allowed_roots
+            .iter()
+            .filter_map(|root| fs::canonicalize(root).ok().map(|c| strip_verbatim_prefix(&c)))
+            .collect();
+        if canonical_roots.is_empty() {
+            return Ok(resolved.to_path_buf());
+        }
+
+        match fs::canonicalize(resolved) {
+            Ok(canonical) => {
+                let canonical = strip_verbatim_prefix(&canonical);
+                if !canonical_roots.iter().any(|root| canonical.starts_with(root)) {
+                    return Err(Error::PathEscape(format!(
+                        "Realpath escapes the allowed roots: {:?} -> {:?}",
+                        resolved, canonical
+                    )));
+                }
+                Ok(canonical)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // New file: the leaf does not exist yet, but an intermediate
+                // junction/symlink may exist and must not reroute the tree.
+                for ancestor in resolved.ancestors().skip(1) {
+                    if let Ok(canonical) = fs::canonicalize(ancestor) {
+                        let canonical = strip_verbatim_prefix(&canonical);
+                        if !canonical_roots.iter().any(|root| canonical.starts_with(root)) {
+                            return Err(Error::PathEscape(format!(
+                                "Realpath escapes the allowed roots: {:?} -> {:?}",
+                                ancestor, canonical
+                            )));
+                        }
+                        return Ok(resolved.to_path_buf());
+                    }
+                }
+                Ok(resolved.to_path_buf())
+            }
+            Err(err) => Err(Error::Io(err)),
+        }
+    }
+
+    fn resolve_against_roots(&self, project_id: ProjectId, path: &Path) -> Result<(PathBuf, PathBuf)> {
+        // If path is already absolute and within a root, use it directly.
+        // `Path::starts_with` is component-wise, so `C:\ws2` is never "within"
+        // `C:\ws` (separator-boundary safe without string prefix tricks).
         if path.is_absolute() {
-            if self.is_within_roots(path) {
-                return Ok(path.to_path_buf());
+            for root in &self.allowed_roots {
+                if path.starts_with(root) {
+                    return Ok((path.to_path_buf(), root.clone()));
+                }
             }
             return Err(Error::PathNotAllowed(format!(
                 "Absolute path not within allowed roots: {:?}",
@@ -232,8 +381,8 @@ impl PathValidator {
         // Try resolving against each allowed root
         for root in &self.allowed_roots {
             let joined = root.join(path);
-            if self.is_within_roots(&joined) {
-                return Ok(joined);
+            if joined.starts_with(root) {
+                return Ok((joined, root.clone()));
             }
         }
 
@@ -244,30 +393,204 @@ impl PathValidator {
     }
 }
 
-/// Normalize a path - resolve . and .. components, handle separators
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut components = Vec::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                if !components.is_empty() {
-                    components.pop();
+impl Default for PathValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Split a path string into non-empty components on both separators.
+///
+/// Deliberately string-based: Windows `Path` component parsing silently trims
+/// trailing dots/spaces, which would hide `file.` / `NUL.` from the rejection
+/// checks that must run before normalization.
+fn split_path_components(raw: &str) -> Vec<&str> {
+    raw.split(['/', '\\']).filter(|c| !c.is_empty()).collect()
+}
+
+/// `C:` and only `C:`: a drive prefix is exactly an ASCII letter plus a colon at
+/// the first path component (the split already guarantees a separator or the end
+/// of string follows). Anything else — `file.txt:stream`, `C:data\evil` (drive-
+/// relative), `C:\ws\C:\evil` — is an NTFS alternate data stream or a stray
+/// drive reference and is rejected. Verbatim `\\?\C:` never reaches here because
+/// `\\`-headed paths are rejected as device/UNC paths earlier.
+fn is_drive_prefix_component(component: &str, index: usize) -> bool {
+    let bytes = component.as_bytes();
+    index == 0
+        && bytes.len() == 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+}
+
+/// Case-insensitive match against the reserved DOS device names, including the
+/// `CON.txt` extension form, i.e. `^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..+)?$`.
+fn is_windows_device_component(component: &str) -> bool {
+    let upper = component.to_ascii_uppercase();
+    if WINDOWS_DEVICE_NAMES.contains(&upper.as_str()) {
+        return true;
+    }
+    match upper.split_once('.') {
+        Some((stem, ext)) => !ext.is_empty() && WINDOWS_DEVICE_NAMES.contains(&stem),
+        None => false,
+    }
+}
+
+/// Normalize a Windows path string.
+///
+/// "/c/tmp/x" -> "C:\tmp\x"; "C:" -> "C:\"; lowercases→capitalizes drive letter;
+/// forward slashes → backslashes; collapses `\\` runs (outside a leading UNC
+/// head, which is preserved as `\\server\share`). A `\\?\` verbatim head is
+/// returned untouched.
+#[cfg(windows)]
+pub fn normalize_windows_path(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len() + 1);
+    let mut i = 0usize;
+
+    // Verbatim / device namespace heads pass through unchanged.
+    if chars.len() >= 4
+        && ((chars[0] == '\\' && chars[1] == '\\' && (chars[2] == '.' || chars[2] == '?') && chars[3] == '\\'))
+    {
+        return input.to_string();
+    }
+
+    // Preserve UNC heads: `\\server\share` (also spelled `//server/share`).
+    if chars.len() >= 2
+        && ((chars[0] == '\\' && chars[1] == '\\') || (chars[0] == '/' && chars[1] == '/'))
+    {
+        out.push_str("\\\\");
+        i = 2;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '/' || c == '\\' {
+                if !out.ends_with('\\') {
+                    out.push('\\');
                 }
+            } else {
+                out.push(c);
             }
-            std::path::Component::CurDir => { /* skip */ }
-            std::path::Component::Normal(c) => {
-                components.push(c.to_os_string());
-            }
-            std::path::Component::RootDir => { /* skip - handled by root joining */ }
-            std::path::Component::Prefix(_) => { /* skip - could be Windows drive prefix */ }
+            i += 1;
         }
+        return out;
+    }
+
+    // `/c/tmp/x` (also `/c\tmp\x`, `/c`) is the slash-drive spelling of `C:\...`.
+    if chars.len() >= 2
+        && chars[0] == '/'
+        && chars[1].is_ascii_alphabetic()
+        && (chars.len() == 2 || chars[2] == '/' || chars[2] == '\\')
+    {
+        out.push(chars[1].to_ascii_uppercase());
+        out.push(':');
+        out.push('\\');
+        i = if chars.len() > 2 { 3 } else { 2 };
+    } else if chars.len() >= 2 && chars[0].is_ascii_alphabetic() && chars[1] == ':' {
+        // Drive-letter form: capitalize; a bare `C:` gains its root separator.
+        out.push(chars[0].to_ascii_uppercase());
+        out.push(':');
+        i = 2;
+        if i == chars.len() {
+            out.push('\\'); // "C:" -> "C:\"
+        } else if chars[i] == '/' || chars[i] == '\\' {
+            out.push('\\');
+            i += 1;
+        }
+        // `C:name` (drive-relative) is left intact; the colon check rejects it.
+    } else if !chars.is_empty() && (chars[0] == '/' || chars[0] == '\\') {
+        // Rooted without a drive keeps its root separator.
+        out.push('\\');
+        i = 1;
+    }
+
+    // Body: separators become `\`, runs collapse to one.
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '/' || c == '\\' {
+            if !out.ends_with('\\') {
+                out.push('\\');
+            }
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Normalize a path — resolve `.` and `..` components, handle separators.
+///
+/// Unlike the historical version this retains `Component::Prefix` and
+/// `Component::RootDir`, so absolute inputs stay absolute (dropping the drive
+/// prefix silently turned `C:\ws\sub` into the relative `ws\sub`). Leading `..`
+/// components that climb above an *unanchored* path are preserved so the
+/// traversal check can see them; an anchored path (drive/root present) cannot
+/// climb above its root, so excess `..` there is a no-op, matching Win32.
+fn normalize_path(path: &Path) -> PathBuf {
+    enum Piece {
+        Normal(OsString),
+        Parent,
     }
 
     let mut result = PathBuf::new();
-    for c in components {
-        result.push(c);
+    let mut stack: Vec<Piece> = Vec::new();
+    let mut anchored = false;
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                result.push(prefix.as_os_str());
+                anchored = true;
+            }
+            Component::RootDir => {
+                result.push(component.as_os_str());
+                anchored = true;
+            }
+            Component::CurDir => { /* skip */ }
+            Component::Normal(c) => stack.push(Piece::Normal(c.to_os_string())),
+            Component::ParentDir => match stack.last() {
+                Some(Piece::Normal(_)) => {
+                    stack.pop();
+                }
+                Some(Piece::Parent) => {
+                    if !anchored {
+                        stack.push(Piece::Parent);
+                    }
+                }
+                None => {
+                    if !anchored {
+                        // Escapes above the base stay visible for the traversal check.
+                        stack.push(Piece::Parent);
+                    }
+                    // Anchored: e.g. `C:\..` is `C:\` on Windows; drop the excess.
+                }
+            },
+        }
+    }
+
+    for piece in stack {
+        match piece {
+            Piece::Normal(c) => result.push(c),
+            Piece::Parent => result.push(".."),
+        }
     }
     result
+}
+
+/// Collapse MUP/verbatim drive prefixes (`\\?\C:\x` -> `C:\x`) on the canonical
+/// paths produced by `fs::canonicalize` on Windows, so containment and deny
+/// checks written against plain paths keep matching. `\\?\UNC\...` forms are
+/// kept verbatim (they still escape drive-relative misreading). Non-UTF-8 paths
+/// are returned untouched.
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    if let Some(text) = path.to_str() {
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            let bytes = rest.as_bytes();
+            if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Check if a path component is valid (no special characters, not reserved)
@@ -289,12 +612,6 @@ pub fn is_valid_component(component: &str) -> bool {
     true
 }
 
-impl Default for PathValidator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Check path safety without requiring a project (for validation only)
 pub fn check_path_safety(user_path: &Path, allowed_roots: &[PathBuf]) -> PathValidationResult {
     let mut violations = Vec::new();
@@ -305,8 +622,9 @@ pub fn check_path_safety(user_path: &Path, allowed_roots: &[PathBuf]) -> PathVal
         violations.push(PathViolation::NullByte);
     }
 
-    // UNC path check
-    if user_path.starts_with("\\\\") || user_path.starts_with("//") {
+    // UNC path check (string-based: a `\\server\share` head parses as a Prefix,
+    // so component-wise `starts_with` would miss it)
+    if user_path.to_string_lossy().starts_with("\\\\") || user_path.to_string_lossy().starts_with("//") {
         violations.push(PathViolation::UncPath);
     }
 
@@ -338,6 +656,14 @@ pub fn check_path_safety(user_path: &Path, allowed_roots: &[PathBuf]) -> PathVal
         relative_path,
         violations,
     }
+}
+
+/// Collapse `.`/`..` and report whether the result still climbs above its base
+/// (shared with `operations::comprehensive_path_check`).
+pub(crate) fn contains_traversal(path: &Path) -> bool {
+    let normalized = normalize_path(path);
+    let s = normalized.to_string_lossy();
+    s.starts_with("..") || s.contains("/..") || s.contains("\\..")
 }
 
 #[cfg(test)]
@@ -417,5 +743,198 @@ mod tests {
         assert!(!is_valid_component("CON"));
         #[cfg(windows)]
         assert!(!is_valid_component("NUL"));
+    }
+
+    #[test]
+    fn validate_rejects_ads_colon_stream() {
+        let v = PathValidator::new().with_root(PathBuf::from("C:\\ws"));
+        let err = v.validate(ProjectId::new(), Path::new("notes.txt:secret")).unwrap_err();
+        assert!(matches!(err, Error::PathNotAllowed(_)));
+    }
+
+    #[test]
+    fn validate_rejects_reserved_name_with_extension() {
+        let v = PathValidator::new().with_root(PathBuf::from("C:\\ws"));
+        assert!(v.validate(ProjectId::new(), Path::new("src/NUL.txt")).is_err());
+        assert!(v.validate(ProjectId::new(), Path::new("src/CON.txt")).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_trailing_dot_and_space_components() {
+        let v = PathValidator::new().with_root(PathBuf::from("C:\\ws"));
+        assert!(v.validate(ProjectId::new(), Path::new("src/file.")).is_err());
+        assert!(v.validate(ProjectId::new(), Path::new("src/file ")).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_colon_after_drive_component() {
+        let v = PathValidator::new().with_root(PathBuf::from("C:\\ws"));
+        assert!(v.validate(ProjectId::new(), Path::new("C:\\ws\\C:\\evil")).is_err());
+    }
+
+    #[test]
+    fn read_mode_allows_readonly_root_write_mode_refuses() {
+        let v = PathValidator::new()
+            .with_root(PathBuf::from("C:\\ws"))
+            .with_read_only_root(PathBuf::from("C:\\ws\\vendor"));
+        let ok = v.validate_access(ProjectId::new(), Path::new("vendor/lib.rs"), AccessMode::Read);
+        assert!(ok.is_ok());
+        let err = v.validate_access(ProjectId::new(), Path::new("vendor/lib.rs"), AccessMode::Write).unwrap_err();
+        assert!(err.to_string().contains("read-only"));
+    }
+
+    /// Build the git-bash-style slash-drive spelling of an absolute Windows path:
+    /// `C:\a\b` -> `/c/a/b`.
+    #[cfg(windows)]
+    fn to_slash_drive_form(p: &Path) -> String {
+        let text = p.to_string_lossy().replace('/', "\\");
+        let drive = text.chars().next().unwrap_or_default().to_ascii_lowercase();
+        let rest = text.chars().skip(2).collect::<String>(); // drop `X:`
+        let rest = rest.replacen('\\', "/", 1); // `\Users\...` -> `/Users/...`
+        format!("/{}{}", drive, rest)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_converts_slash_drive_paths() {
+        let tmp = std::env::temp_dir();
+        let v = PathValidator::new().with_root(tmp.clone());
+        // "/c/Users/..." spelling must resolve to the same drive root.
+        // (Deviation from the brief's literal `format!("/{}/foo.txt", drive_char)`,
+        // which yields "/c/foo.txt" — a path that can never live inside the temp
+        // root. The test's own comment pins the intent: the full slash-drive
+        // spelling of the registered root.)
+        let slash_form = format!("{}/foo.txt", to_slash_drive_form(&tmp));
+        let r = v.validate_access(ProjectId::new(), Path::new(&slash_form), AccessMode::Read);
+        assert!(r.is_ok(), "slash-drive form should validate: {slash_form}");
+    }
+
+    /// Create a directory junction (NTFS mount-point reparse point). Junctions
+    /// need no special privilege — exactly the mechanism unprivileged malware
+    /// uses — so tests can exercise the realpath re-containment deterministically.
+    #[cfg(windows)]
+    fn create_junction(target: &Path, link: &Path) -> std::io::Result<()> {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use std::{io, ptr};
+        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        let mut link_wide: Vec<u16> = OsStr::new(link).encode_wide().collect();
+        link_wide.push(0);
+
+        let handle = unsafe {
+            CreateFileW(
+                link_wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+
+        // REPARSE_DATA_BUFFER (mount point):
+        //   tag u32 | data_len u16 | reserved u16 |
+        //   SubstituteNameOffset u16 | SubstituteNameLength u16 |
+        //   PrintNameOffset u16 | PrintNameLength u16 | PathBuffer[...]
+        let subst_text = format!(r"\??\{}", target.display());
+        let subst: Vec<u16> = OsStr::new(subst_text.as_str()).encode_wide().chain(Some(0)).collect();
+        let path_buffer_len_bytes = (subst.len() + 1) * 2; // substitute name (NUL ended) + empty print name (NUL)
+
+        let mut buffer: Vec<u8> = Vec::new();
+        buffer.extend_from_slice(&windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        buffer.extend_from_slice(&((path_buffer_len_bytes + 8) as u16).to_le_bytes()); // ReparseDataLength
+        buffer.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+        buffer.extend_from_slice(&0u16.to_le_bytes()); // SubstituteNameOffset
+        buffer.extend_from_slice(&((subst.len() as u16 - 1) * 2).to_le_bytes()); // SubstituteNameLength
+        buffer.extend_from_slice(&((subst.len() as u16) * 2).to_le_bytes()); // PrintNameOffset
+        buffer.extend_from_slice(&0u16.to_le_bytes()); // PrintNameLength (empty)
+        for wide in subst.iter().copied().chain(std::iter::once(0)) {
+            buffer.extend_from_slice(&wide.to_le_bytes());
+        }
+
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_SET_REPARSE_POINT,
+                buffer.as_ptr() as *const std::ffi::c_void,
+                buffer.len() as u32,
+                ptr::null_mut(),
+                0,
+                &mut returned,
+                ptr::null_mut(),
+            )
+        };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_rejects_junction_escape_at_call_time() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(root.join("link")).unwrap();
+        // Deviation from the brief: `std::os::windows::fs::junction` is not
+        // stabilized in this toolchain (rustc 1.99.1), so the test creates the
+        // junction directly through FSCTL_SET_REPARSE_POINT — privilege-free,
+        // like an unprivileged junction escape attempt would be.
+        if let Err(err) = create_junction(outside.path(), &root.join("link")) {
+            panic!("junction creation failed (unexpected on NTFS): {err}");
+        }
+        let v = PathValidator::new().with_root(root.clone());
+        let err = v.validate(ProjectId::new(), Path::new("link/secret.txt")).unwrap_err();
+        assert!(matches!(err, Error::PathEscape(_)));
+    }
+
+    #[test]
+    fn validate_access_realpath_recontainment_positive_paths() {
+        // Positive control: re-containment must not fail-closed for plain
+        // inside-root paths, both for an existing leaf (canonicalize success)
+        // and for a new leaf whose parent chain resolves inside the roots.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("exists.txt"), b"payload").unwrap();
+        let v = PathValidator::new().with_root(root.clone());
+
+        let existing = v
+            .validate_access(ProjectId::new(), Path::new("exists.txt"), AccessMode::Read)
+            .expect("existing inside-root file must validate");
+        assert_eq!(
+            std::fs::read(&existing.absolute_path).unwrap(),
+            b"payload",
+            "canonical path must still point at the same real file"
+        );
+
+        let new_file = v
+            .validate_access(ProjectId::new(), Path::new("newdir/new.txt"), AccessMode::Write)
+            .expect("new file in an inside-root existing directory chain must validate");
+        assert_eq!(new_file.relative_path, PathBuf::from("newdir").join("new.txt"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_windows_path_forms() {
+        assert_eq!(normalize_windows_path("/c/tmp/x"), "C:\\tmp\\x");
+        assert_eq!(normalize_windows_path("C:"), "C:\\");
+        assert_eq!(normalize_windows_path("c:\\a\\b"), "C:\\a\\b");
+        assert_eq!(normalize_windows_path("\\\\server\\share\\f"), "\\\\server\\share\\f");
+        assert_eq!(normalize_windows_path("/Users/x"), "\\Users\\x");
     }
 }

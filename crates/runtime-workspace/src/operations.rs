@@ -139,7 +139,10 @@ pub fn validate_no_device_names(path: &Path) -> Result<()> {
 
 /// Validate that a path is not a UNC path
 pub fn validate_no_unc(path: &Path) -> Result<()> {
-    if path.starts_with("\\\\") || path.starts_with("//") {
+    // String-based: `Path::starts_with` compares components, which silently
+    // misses `\\server\share` heads on Windows (they parse as a Prefix).
+    let raw = path.to_string_lossy();
+    if raw.starts_with("\\\\") || raw.starts_with("//") {
         return Err(Error::PathNotAllowed("UNC paths not allowed".to_string()));
     }
     Ok(())
@@ -164,6 +167,11 @@ pub fn comprehensive_path_check(
     validate_no_device_names(path)?;
     validate_no_unc(path)?;
     validate_no_ads(path)?;
+
+    // Refuse `..` climbs that escape above the base after normalization.
+    if crate::path_safety::contains_traversal(path) {
+        return Err(Error::PathEscape(format!("Path traversal detected: {:?}", path)));
+    }
 
     // Check containment
     for root in allowed_roots {
