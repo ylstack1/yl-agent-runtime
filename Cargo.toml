@@ -86,6 +86,14 @@ tempfile = "3.10"
 proptest = "1.4"
 which = "6.0"
 
+# Phase 1 toolset: diffs, gitignore-aware walking, globs, hashing
+diffy = "0.5"
+ignore = "0.4"
+globset = "0.4"
+regex = "1.11"
+sha2 = "0.10"
+base64 = "0.22"
+
 # Platform-specific dependencies (declared here so crate manifests can
 # reference them with { workspace = true }; each crate gates actual use via
 # #[cfg(target_os = "...")] in its source code).
