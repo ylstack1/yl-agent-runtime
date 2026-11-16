@@ -8,9 +8,11 @@ pub mod path_safety;
 pub mod operations;
 pub mod sensitive;
 pub mod files;
+pub mod search;
 
 pub use runtime_core::traits::WorkspaceService;
 pub use service::WorkspaceServiceImpl;
 pub use path_safety::*;
 pub use operations::*;
 pub use sensitive::*;
+pub use search::*;
