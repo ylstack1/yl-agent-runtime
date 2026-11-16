@@ -18,7 +18,7 @@ pub const LINE_CUT_AT: usize = 4000;
 /// detect binary content.
 const PROBE_WINDOW: usize = 8192;
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ReadOptions {
     pub offset: Option<u64>,        // byte offset
@@ -30,6 +30,24 @@ pub struct ReadOptions {
     pub line_numbers: bool,
     pub media: bool,
     pub want_sha256: bool,
+}
+
+// Line numbering defaults to ON in line mode per the Task 4 brief; callers
+// (Task 9/11) opt out by setting `line_numbers: false`.
+impl Default for ReadOptions {
+    fn default() -> Self {
+        Self {
+            offset: None,
+            max_bytes: None,
+            line_start: None,
+            line_end: None,
+            head: None,
+            tail: None,
+            line_numbers: true,
+            media: false,
+            want_sha256: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -290,12 +308,24 @@ fn read_lines(path: &Path, opts: &ReadOptions) -> Result<ReadOutcome> {
         let number = start + index as u64;
         let cut = if line.len() > LINE_CUT_AT {
             truncated = true;
-            format!("{} ...[line cut]", &line[..LINE_CUT_AT])
+            // Cut at the nearest UTF-8 char boundary <= LINE_CUT_AT so
+            // &line[..cut_end] never panics on a multi-byte boundary.
+            let cut_end = line
+                .char_indices()
+                .take_while(|(i, _)| *i <= LINE_CUT_AT)
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            format!("{} ...[line cut]", &line[..cut_end])
         } else {
             line.to_string()
         };
-        // Line mode defaults line_numbers to on.
-        out.push(format!("{number}\t{cut}"));
+        let entry = if opts.line_numbers {
+            format!("{number}\t{cut}")
+        } else {
+            cut
+        };
+        out.push(entry);
     }
 
     let content = out.join("\n");
@@ -362,6 +392,25 @@ mod tests {
         match read_text(file.path(), &opts) {
             Ok(ReadOutcome::Text(t)) => {
                 assert_eq!(t.content, "2\tl2\n3\tl3");
+                assert_eq!(t.next_line, Some(4));
+                assert_eq!(t.total_lines, None);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn line_mode_without_numbers_returns_plain_lines() {
+        let file = seed_file();
+        let opts = ReadOptions {
+            line_start: Some(2),
+            line_end: Some(3),
+            line_numbers: false,
+            ..Default::default()
+        };
+        match read_text(file.path(), &opts) {
+            Ok(ReadOutcome::Text(t)) => {
+                assert_eq!(t.content, "l2\nl3");
                 assert_eq!(t.next_line, Some(4));
                 assert_eq!(t.total_lines, None);
             }
