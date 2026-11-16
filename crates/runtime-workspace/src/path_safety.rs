@@ -165,9 +165,10 @@ impl PathValidator {
         // (Win32 strips them) and could absorb stray colons afterwards.
         //
         // (brief step 3) ADS / stray drive colon: a ':' is only legal as the drive
-        // prefix (`^[A-Za-z]:`). This must run before root containment.
-        for (idx, component) in split_path_components(&raw).into_iter().enumerate() {
-            if component.contains(':') && !is_drive_prefix_component(component, idx) {
+        // prefix (`^[A-Za-z]:`, anchored at string offset 0). This must run before
+        // root containment.
+        for (start, component) in split_path_components(&raw) {
+            if component.contains(':') && !(start == 0 && is_drive_prefix_component(component)) {
                 violations.push(PathViolation::AlternateDataStream);
                 return Err(Error::PathNotAllowed(format!(
                     "Alternate data streams / stray drive colon not allowed: {:?}",
@@ -177,7 +178,7 @@ impl PathValidator {
         }
         // (brief steps 4 + 5) reserved device names per component (incl. `CON.txt`)
         // and trailing dot/space components.
-        for component in split_path_components(&raw) {
+        for (_, component) in split_path_components(&raw) {
             if component == "." || component == ".." {
                 continue; // navigation, handled by normalization/traversal check
             }
@@ -244,18 +245,25 @@ impl PathValidator {
         let final_path = self.recontain_via_realpath(&resolved)?;
 
         // (brief step 9) deny lists + read-only roots on the final path; denies
-        // apply to every mode, read-only roots only refuse Write/Move.
+        // apply to every mode, read-only roots only refuse Write/Move. Read-only
+        // roots are matched case-folded on Windows and canonicalized when they
+        // exist, so a mis-cased registration (or an 8.3/verbatim spelling)
+        // cannot let a write land inside a "read-only" root.
         self.check_deny_and_sensitive(&final_path, &mut violations)?;
         if matches!(mode, AccessMode::Write | AccessMode::Move) {
-            let ro_hit = self
-                .read_only_roots
-                .iter()
-                .find(|root| final_path.starts_with(*root) || resolved.starts_with(*root));
-            if let Some(root) = ro_hit {
-                return Err(Error::PathNotAllowed(format!(
-                    "Path is in a read-only root: {}",
-                    root.display()
-                )));
+            for root in &self.read_only_roots {
+                let canonical_root = fs::canonicalize(root).ok().map(|c| strip_verbatim_prefix(&c));
+                let withheld = starts_with_folded(&final_path, root)
+                    || starts_with_folded(&resolved, root)
+                    || canonical_root
+                        .map(|c| starts_with_folded(&final_path, &c) || starts_with_folded(&resolved, &c))
+                        .unwrap_or(false);
+                if withheld {
+                    return Err(Error::PathNotAllowed(format!(
+                        "Path is in a read-only root: {}",
+                        root.display()
+                    )));
+                }
             }
         }
 
@@ -285,7 +293,16 @@ impl PathValidator {
     /// and the canonical (realpath) form so a junction cannot launder a target.
     fn check_deny_and_sensitive(&self, resolved: &Path, violations: &mut Vec<PathViolation>) -> Result<()> {
         for deny in &self.deny_paths {
-            if resolved.starts_with(deny) {
+            let denied = starts_with_folded(resolved, deny)
+                // Restriction roots are canonicalized when they exist, so a
+                // junction (or 8.3 / casing difference) cannot dodge the deny by
+                // spelling. Registration errors that make the deny unresolvable
+                // keep the textual check above (containment itself is unaffected).
+                || fs::canonicalize(deny)
+                    .ok()
+                    .map(|c| starts_with_folded(resolved, &strip_verbatim_prefix(&c)))
+                    .unwrap_or(false);
+            if denied {
                 violations.push(PathViolation::SensitiveDirectory);
                 return Err(Error::PathNotAllowed(format!(
                     "Path is in denied directory: {:?}",
@@ -311,22 +328,34 @@ impl PathValidator {
     /// Canonicalize the contained path and enforce containment a second time so
     /// junctions/symlinks inside a root cannot escape it.
     ///
-    /// ENOENT (new file) is tolerated: the deepest existing *ancestor* is
-    /// canonicalized instead, so an intermediate junction is still caught. If
-    /// nothing below the roots can be canonicalized at all (no root exists on
-    /// disk, e.g. synthetic test roots), the pre-canonical resolved path is used
-    /// — its textual containment already held. Any other canonicalize error fails
-    /// closed with `Error::Io` rather than silently passing.
+    /// Fail-closed semantics: a root that exists but cannot be canonicalized is
+    /// not a verifiable containment anchor and fails the validation; the
+    /// ancestor walk only tolerates `NotFound` (missing components) — any other
+    /// ancestor error fails, and exhausting the walk without a resolvable
+    /// ancestor fails too. ENOENT (new file) is tolerated by canonicalizing the
+    /// deepest existing *ancestor* instead, so an intermediate junction is still
+    /// caught. The synthetic-root skip remains available only when *every* root
+    /// canonicalizes with `NotFound` (not on disk at all, e.g. pure-text test
+    /// registries) — there is no realpath structure to verify and the textual
+    /// containment above already held.
     fn recontain_via_realpath(&self, resolved: &Path) -> Result<PathBuf> {
         // Compare realpaths against canonicalized roots: on Windows `canonicalize`
         // returns verbatim `\\?\` paths and resolves 8.3 short names, so the raw
         // registered roots cannot be prefix-matched against the canonical target.
-        let canonical_roots: Vec<PathBuf> = self
-            .allowed_roots
-            .iter()
-            .filter_map(|root| fs::canonicalize(root).ok().map(|c| strip_verbatim_prefix(&c)))
-            .collect();
+        let mut canonical_roots: Vec<PathBuf> = Vec::new();
+        for root in &self.allowed_roots {
+            match fs::canonicalize(root) {
+                Ok(canonical) => canonical_roots.push(strip_verbatim_prefix(&canonical)),
+                // Root not on disk: nothing can be verified against it here.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                // Fail closed: an existing root that cannot be canonicalized
+                // (ACL, reparse anomaly, ...) must not disable re-containment.
+                Err(err) => return Err(Error::Io(err)),
+            }
+        }
         if canonical_roots.is_empty() {
+            // No root exists on disk (synthetic registry): fall back to the
+            // textual containment that already held above.
             return Ok(resolved.to_path_buf());
         }
 
@@ -345,18 +374,32 @@ impl PathValidator {
                 // New file: the leaf does not exist yet, but an intermediate
                 // junction/symlink may exist and must not reroute the tree.
                 for ancestor in resolved.ancestors().skip(1) {
-                    if let Ok(canonical) = fs::canonicalize(ancestor) {
-                        let canonical = strip_verbatim_prefix(&canonical);
-                        if !canonical_roots.iter().any(|root| canonical.starts_with(root)) {
-                            return Err(Error::PathEscape(format!(
-                                "Realpath escapes the allowed roots: {:?} -> {:?}",
-                                ancestor, canonical
-                            )));
+                    match fs::canonicalize(ancestor) {
+                        Ok(canonical) => {
+                            let canonical = strip_verbatim_prefix(&canonical);
+                            if !canonical_roots.iter().any(|root| canonical.starts_with(root)) {
+                                return Err(Error::PathEscape(format!(
+                                    "Realpath escapes the allowed roots: {:?} -> {:?}",
+                                    ancestor, canonical
+                                )));
+                            }
+                            return Ok(resolved.to_path_buf());
                         }
-                        return Ok(resolved.to_path_buf());
+                        // Missing ancestor (above the first missing component):
+                        // keep walking toward the root.
+                        Err(anc_err) if anc_err.kind() == std::io::ErrorKind::NotFound => continue,
+                        // Fail closed: an unresolvable ancestor cannot be
+                        // verified as contained.
+                        Err(anc_err) => return Err(Error::Io(anc_err)),
                     }
                 }
-                Ok(resolved.to_path_buf())
+                // Walk exhausted without a resolvable ancestor (e.g. the path
+                // sits under a root that is not on disk at all): containment is
+                // unverifiable, so treat it as an escape risk.
+                Err(Error::PathEscape(format!(
+                    "Realpath chain unresolvable; cannot verify containment: {:?}",
+                    resolved
+                )))
             }
             Err(err) => Err(Error::Io(err)),
         }
@@ -399,27 +442,34 @@ impl Default for PathValidator {
     }
 }
 
-/// Split a path string into non-empty components on both separators.
+/// Split a path string into non-empty components paired with their byte offset
+/// in the raw string, on both separators.
 ///
 /// Deliberately string-based: Windows `Path` component parsing silently trims
 /// trailing dots/spaces, which would hide `file.` / `NUL.` from the rejection
 /// checks that must run before normalization.
-fn split_path_components(raw: &str) -> Vec<&str> {
-    raw.split(['/', '\\']).filter(|c| !c.is_empty()).collect()
+fn split_path_components(raw: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for segment in raw.split(['/', '\\']) {
+        if !segment.is_empty() {
+            out.push((pos, segment));
+        }
+        pos += segment.len() + 1;
+    }
+    out
 }
 
-/// `C:` and only `C:`: a drive prefix is exactly an ASCII letter plus a colon at
-/// the first path component (the split already guarantees a separator or the end
-/// of string follows). Anything else — `file.txt:stream`, `C:data\evil` (drive-
+/// `C:` and only `C:` at the very beginning of the path string: a drive prefix
+/// is exactly an ASCII letter plus a colon at byte offset 0 — the split offset
+/// anchors the exemption, so `/c:` (offset 1) and `\\c:` are rejected like any
+/// other stray colon. Anything else — `file.txt:stream`, `C:data\evil` (drive-
 /// relative), `C:\ws\C:\evil` — is an NTFS alternate data stream or a stray
 /// drive reference and is rejected. Verbatim `\\?\C:` never reaches here because
 /// `\\`-headed paths are rejected as device/UNC paths earlier.
-fn is_drive_prefix_component(component: &str, index: usize) -> bool {
+fn is_drive_prefix_component(component: &str) -> bool {
     let bytes = component.as_bytes();
-    index == 0
-        && bytes.len() == 2
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// Case-insensitive match against the reserved DOS device names, including the
@@ -664,6 +714,35 @@ pub(crate) fn contains_traversal(path: &Path) -> bool {
     let normalized = normalize_path(path);
     let s = normalized.to_string_lossy();
     s.starts_with("..") || s.contains("/..") || s.contains("\\..")
+}
+
+/// Component-wise prefix test, case-insensitive on Windows (NTFS/FAT are
+/// case-insensitive, so a mis-cased deny/read-only registration must not
+/// escape its restriction). Exact on platforms with case-sensitive filesystems.
+#[cfg(windows)]
+fn starts_with_folded(path: &Path, prefix: &Path) -> bool {
+    let mut path_components = path.components();
+    let mut prefix_components = prefix.components();
+    loop {
+        match (path_components.next(), prefix_components.next()) {
+            (Some(p), Some(q)) => {
+                if !p
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&q.as_os_str().to_string_lossy())
+                {
+                    return false;
+                }
+            }
+            (Some(_), None) => return true,
+            (None, _) => return false,
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn starts_with_folded(path: &Path, prefix: &Path) -> bool {
+    path.starts_with(prefix)
 }
 
 #[cfg(test)]
@@ -936,5 +1015,112 @@ mod tests {
         assert_eq!(normalize_windows_path("c:\\a\\b"), "C:\\a\\b");
         assert_eq!(normalize_windows_path("\\\\server\\share\\f"), "\\\\server\\share\\f");
         assert_eq!(normalize_windows_path("/Users/x"), "\\Users\\x");
+    }
+
+    #[test]
+    fn validate_rejects_colon_not_at_string_start() {
+        let v = PathValidator::new().with_root(PathBuf::from("C:\\ws"));
+        // "/c:" parses as a drive prefix when the exemption is keyed on split
+        // index; it must be rejected at the ADS colon layer (message marker
+        // "stream"), anchored at string position 0, not by a downstream
+        // containment miss.
+        for input in ["/c:", "/c:/steal"] {
+            let err = v.validate(ProjectId::new(), Path::new(input)).unwrap_err();
+            assert!(
+                err.to_string().contains("stream"),
+                "colon check must reject {input:?} at the ADS layer, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_root_enforced_regardless_of_casing() {
+        #[cfg(windows)]
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let vend = tmp.path().join("vendor");
+            std::fs::create_dir_all(&vend).unwrap();
+            // Mis-cased read-only registration: case-insensitive NTFS must still
+            // refuse Write/Move through the lower-cased spelling.
+            let upper = tmp.path().to_string_lossy().to_uppercase();
+            let v = PathValidator::new()
+                .with_root(tmp.path().to_path_buf())
+                .with_read_only_root(PathBuf::from(format!("{}\\VENDOR", upper)));
+            let read = v.validate_access(ProjectId::new(), Path::new("vendor/x.txt"), AccessMode::Read);
+            assert!(read.is_ok(), "reads inside a read-only root are allowed: {read:?}");
+            let err = v
+                .validate_access(ProjectId::new(), Path::new("vendor/x.txt"), AccessMode::Write)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("read-only"),
+                "mis-cased read-only registration must still refuse writes: {err}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn root_canonicalize_error_fails_closed() {
+        // Hole (c): a root that exists on disk but cannot be canonicalized —
+        // here a reparse-point cycle (os error 1921, FilesystemLoop) — must fail
+        // closed instead of silently disabling re-containment.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = tmp.path().join("loopA");
+        let b = tmp.path().join("loopB");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        create_junction(&b, &a).unwrap(); // a -> b
+        create_junction(&a, &b).unwrap(); // b -> a  => cycle
+        let v = PathValidator::new().with_root(a);
+        let result = v.validate(ProjectId::new(), Path::new("x.txt"));
+        assert!(
+            matches!(result, Err(Error::Io(_))),
+            "uncanonicalizable root must fail closed, got {result:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unresolvable_realpath_chain_fails_closed() {
+        // Hole (b): the ancestor walk must never silently pass when every
+        // ancestor fails. A path under a registered-but-nonexistent root on a
+        // missing volume resolves textually, yet every ancestor canonicalize
+        // fails NotFound, exhausting the walk → Err.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let v = PathValidator::new()
+            .with_root(tmp.path().to_path_buf())
+            .with_root(PathBuf::from("Q:\\synthetic-root"));
+        let result = v.validate_access(
+            ProjectId::new(),
+            Path::new("Q:\\synthetic-root\\x.txt"),
+            AccessMode::Read,
+        );
+        assert!(
+            matches!(result, Err(Error::PathEscape(_)) | Err(Error::Io(_))),
+            "exhausted/unresolvable realpath chain must fail closed, got {result:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reparse_cycle_path_fails_closed_at_every_depth() {
+        // Hole (a) per review fallback ("or use a path with a reparse point
+        // cycle"): an unopenable reparse route inside the root is an Err at any
+        // depth. With std::fs::canonicalize the cycle error surfaces at the
+        // top-level call (probe: error 1921 at all depths); the walk-local
+        // non-NotFound arm this guards alongside it is defense-in-depth — see
+        // task report for the reachability analysis.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = tmp.path().join("loopA");
+        let b = tmp.path().join("loopB");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        create_junction(&b, &a).unwrap();
+        create_junction(&a, &b).unwrap();
+        let v = PathValidator::new().with_root(tmp.path().to_path_buf());
+        let shallow = v.validate_access(ProjectId::new(), Path::new("loopA"), AccessMode::Read);
+        assert!(matches!(shallow, Err(Error::Io(_))), "cycle at leaf depth must fail closed, got {shallow:?}");
+        let deep = v.validate_access(ProjectId::new(), Path::new("loopA\\deep\\x.txt"), AccessMode::Read);
+        assert!(matches!(deep, Err(Error::Io(_))), "cycle under a missing leaf must fail closed, got {deep:?}");
     }
 }
