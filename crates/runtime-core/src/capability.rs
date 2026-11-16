@@ -262,7 +262,7 @@ impl ExecutionProfileConfig {
                     allowed_hosts: vec![],
                 },
                 description: format!("{:?} profile", profile),
-            }),
+            })
     }
 }
 

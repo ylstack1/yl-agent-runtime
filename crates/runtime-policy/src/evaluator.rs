@@ -2,6 +2,7 @@
 
 use runtime_core::capability::*;
 use runtime_core::error::Result;
+use runtime_core::traits::CapabilityGrant;
 use runtime_core::types::*;
 
 /// Evaluate a capability request against grants and profile

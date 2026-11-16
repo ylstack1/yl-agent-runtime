@@ -1,8 +1,8 @@
 //! Policy engine trait implementation
 
 use crate::evaluator::*;
-use crate::profiles::*;
 use crate::store::*;
+use runtime_core::{CapabilityGrant, ExecutionProfileConfig};
 use runtime_core::error::Result;
 use runtime_core::traits::PolicyEngine;
 use runtime_core::types::*;
@@ -62,7 +62,7 @@ impl PolicyEngine for PolicyEngineImpl {
 
     async fn get_profile(&self, project_id: ProjectId) -> Result<ExecutionProfile> {
         let store = self.store.read().await;
-        store.get_profile(project_id)
+        store.get_profile(project_id).await
     }
 
     async fn get_capabilities(
@@ -71,7 +71,7 @@ impl PolicyEngine for PolicyEngineImpl {
         project_id: ProjectId,
     ) -> Result<Vec<CapabilityGrant>> {
         let store = self.store.read().await;
-        store.get_capabilities(agent_id, project_id)
+        store.get_capabilities(agent_id, project_id).await
     }
 }
 

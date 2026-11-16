@@ -86,7 +86,10 @@ impl IdentityServiceImpl {
         let mut hasher = Hasher::new();
         hasher.update(public_key);
         let hash = hasher.finalize();
-        format!("{:x}", &hash.as_bytes()[..16])
+        hash.as_bytes()[..16]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
     }
 }
 

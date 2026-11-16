@@ -3,6 +3,7 @@
 //! Each tool has a JSON schema, permission requirement, timeout, output limit,
 //! audit event, and structured error format per PRD section 13.1.
 
+use runtime_core::audit::AuditEventType;
 use runtime_core::types::*;
 use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;

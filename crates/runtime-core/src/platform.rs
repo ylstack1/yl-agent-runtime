@@ -106,10 +106,9 @@ fn check_app_container() -> Result<bool> {
 
 #[cfg(windows)]
 fn check_elevated() -> Result<bool> {
-    use std::ptr::null_mut;
-    let mut token = null_mut();
+    let mut token = windows::Win32::Foundation::HANDLE::default();
     unsafe {
-        if windows::Win32::Security::Authorization::OpenProcessToken(
+        if windows::Win32::System::Threading::OpenProcessToken(
             windows::Win32::System::Threading::GetCurrentProcess(),
             windows::Win32::Security::TOKEN_QUERY,
             &mut token,
@@ -118,10 +117,10 @@ fn check_elevated() -> Result<bool> {
         {
             let mut elevation = windows::Win32::Security::TOKEN_ELEVATION::default();
             let mut size = std::mem::size_of::<windows::Win32::Security::TOKEN_ELEVATION>() as u32;
-            if windows::Win32::Security::Authorization::GetTokenInformation(
+            if windows::Win32::Security::GetTokenInformation(
                 token,
                 windows::Win32::Security::TokenElevation,
-                &mut elevation as *mut _ as *mut _,
+                Some(&mut elevation as *mut _ as *mut _),
                 size,
                 &mut size,
             )

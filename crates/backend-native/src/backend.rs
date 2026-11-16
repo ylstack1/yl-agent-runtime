@@ -4,7 +4,6 @@ use runtime_backend_api::*;
 use runtime_core::error::{Error, Result};
 use runtime_core::types::*;
 use runtime_core::platform::*;
-use runtime_core::traits::ExecutionBackend as CoreExecutionBackend;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -112,7 +111,7 @@ impl ExecutionBackend for NativeBackend {
             cmd.process_group(0);
         }
 
-        let mut child = cmd.spawn().map_err(|e| Error::Process(format!(
+        let child = cmd.spawn().map_err(|e| Error::Process(format!(
             "Failed to spawn process: {}", e
         )))?;
 

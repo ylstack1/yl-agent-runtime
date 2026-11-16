@@ -18,6 +18,7 @@ bytes = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 target-lexicon = { workspace = true }
+schemars = { workspace = true }
 async-trait = "0.1"
 
 [target.'cfg(windows)'.dependencies]

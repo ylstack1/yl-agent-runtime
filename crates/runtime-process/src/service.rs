@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// Process output
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,13 +22,29 @@ pub struct ProcessOutput {
 }
 
 /// A running process tracked by the runtime
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TrackedProcess {
     pub id: ProcessId,
     pub os_pid: u32,
     pub request: ExecutionRequest,
     pub started_at: DateTime<Utc>,
     pub status: ProcessStatus,
+    /// Handle to the spawned child process (kept behind a Mutex so the
+    /// service can wait on / terminate it after spawning).
+    pub handle: Arc<tokio::sync::Mutex<Option<std::process::Child>>>,
+}
+
+impl Clone for TrackedProcess {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            os_pid: self.os_pid,
+            request: self.request.clone(),
+            started_at: self.started_at,
+            status: self.status.clone(),
+            handle: self.handle.clone(),
+        }
+    }
 }
 
 /// Process service implementation
@@ -79,7 +95,15 @@ impl ProcessServiceOps for ProcessService {
     async fn exec(&self, request: ExecutionRequest) -> Result<ProcessHandle> {
         // Execute and wait for completion
         let handle = self.start(request.clone()).await?;
-        let status = self.wait(handle.id).await?;
+        let exit_status = self.wait(handle.id).await?;
+        let status = ProcessStatus {
+            id: handle.id,
+            os_pid: handle.os_pid,
+            running: false,
+            exit_status: Some(exit_status),
+            resource_usage: ResourceUsage::default(),
+            started_at: chrono::Utc::now(),
+        };
         Ok(ProcessHandle {
             id: handle.id,
             os_pid: handle.os_pid,
@@ -119,11 +143,12 @@ impl ProcessServiceOps for ProcessService {
             cmd.process_group(0);
         }
 
-        let mut child = cmd.spawn().map_err(|e| Error::Process(format!(
+        let child = cmd.spawn().map_err(|e| Error::Process(format!(
             "Failed to spawn process: {}", e
         )))?;
 
         let os_pid = child.id();
+        let handle = Arc::new(Mutex::new(Some(child)));
 
         // Register with supervisor
         self.supervisor.add_process(id, os_pid).await;
@@ -143,6 +168,7 @@ impl ProcessServiceOps for ProcessService {
             request,
             started_at: status.started_at,
             status: status.clone(),
+            handle,
         };
 
         self.processes.write().await.insert(id, tracked);
@@ -160,15 +186,18 @@ impl ProcessServiceOps for ProcessService {
             .get_mut(&id)
             .ok_or_else(|| Error::ProcessNotFound(format!("Process {}", id)))?;
 
-        let exit_status = tracked
-            .handle
+        let mut guard = tracked.handle.lock().await;
+        let mut child = guard
+            .take()
+            .ok_or_else(|| Error::Process(format!("Process {} has no running handle", id)))?;
+        let exit_status = child
             .wait()
             .map_err(|e| Error::Process(format!("Failed to wait for process: {}", e)))?;
 
         let status = ExitStatus::from_code(exit_status.code().unwrap_or(-1));
 
         tracked.status.running = false;
-        tracked.status.exit_status = Some(status);
+        tracked.status.exit_status = Some(status.clone());
 
         Ok(status)
     }
@@ -198,21 +227,22 @@ impl ProcessServiceOps for ProcessService {
             .ok_or_else(|| Error::ProcessNotFound(format!("Process {}", id)))?;
 
         match mode {
-            TerminationMode::Graceful => {
-                tracked.handle.start_kill().map_err(|e| {
-                    Error::Process(format!("Failed to terminate process: {}", e))
-                })?;
-            }
-            TerminationMode::Force => {
-                tracked.handle.start_kill().map_err(|e| {
-                    Error::Process(format!("Failed to kill process: {}", e))
-                })?;
+            TerminationMode::Graceful | TerminationMode::Force => {
+                let mut guard = tracked.handle.lock().await;
+                if let Some(mut child) = guard.take() {
+                    child.kill().map_err(|e| {
+                        Error::Process(format!("Failed to terminate process: {}", e))
+                    })?;
+                }
             }
             TerminationMode::ProcessTree => {
                 self.supervisor.terminate_tree(id).await?;
-                tracked.handle.start_kill().map_err(|e| {
-                    Error::Process(format!("Failed to kill process tree: {}", e))
-                })?;
+                let mut guard = tracked.handle.lock().await;
+                if let Some(mut child) = guard.take() {
+                    child.kill().map_err(|e| {
+                        Error::Process(format!("Failed to kill process tree: {}", e))
+                    })?;
+                }
             }
         }
 

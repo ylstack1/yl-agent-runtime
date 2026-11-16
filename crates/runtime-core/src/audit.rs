@@ -2,6 +2,7 @@
 
 use crate::types::*;
 use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -157,7 +158,7 @@ impl AuditEvent {
 }
 
 /// Types of audit events
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditEventType {
     /// Workspace operations

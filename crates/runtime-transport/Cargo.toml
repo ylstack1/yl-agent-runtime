@@ -25,4 +25,4 @@ runtime-audit = { path = "../runtime-audit" }
 
 [features]
 default = []
-iroh = ["iroh"]
+iroh = ["dep:iroh"]

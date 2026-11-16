@@ -1,5 +1,6 @@
 //! Approval broker implementation
 
+use runtime_core::ApprovalState;
 use runtime_core::error::{Error, Result};
 use runtime_core::types::*;
 use serde::{Deserialize, Serialize};

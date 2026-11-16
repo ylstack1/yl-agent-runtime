@@ -19,12 +19,6 @@ tokio-util = { workspace = true }
 portable-pty = { workspace = true }
 async-trait = "0.1"
 runtime-core = { path = "../runtime-core" }
-runtime-policy = { path = "../runtime-policy" }
-runtime-workspace = { path = "../runtime-workspace" }
-runtime-toolchain = { path = "../runtime-toolchain" }
-runtime-audit = { path = "../runtime-audit" }
-runtime-backend-api = { path = "../runtime-backend-api" }
-backend-native = { path = "../backend-native" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

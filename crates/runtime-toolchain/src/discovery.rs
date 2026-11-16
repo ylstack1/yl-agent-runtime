@@ -8,11 +8,12 @@ use runtime_core::types::*;
 use std::path::PathBuf;
 use std::process::Command;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// Toolchain discovery service
 pub struct ToolchainDiscovery {
     known_locations: Vec<PathBuf>,
-    cache: HashMap<String, Option<Toolchain>>,
+    cache: Mutex<HashMap<String, Option<Toolchain>>>,
 }
 
 impl ToolchainDiscovery {
@@ -37,7 +38,7 @@ impl ToolchainDiscovery {
 
         Self {
             known_locations,
-            cache: HashMap::new(),
+            cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -80,7 +81,7 @@ impl ToolchainDiscovery {
 
     /// Find a specific toolchain by name
     pub fn find_by_name(&self, name: &str) -> Result<Option<Toolchain>> {
-        if let Some(cached) = self.cache.get(name) {
+        if let Some(cached) = self.cache.lock().unwrap().get(name) {
             return Ok(cached.clone());
         }
 
@@ -111,7 +112,7 @@ impl ToolchainDiscovery {
     fn find_by_name_internal(&self, name: &str, cmd_name: &str) -> Result<Option<Toolchain>> {
         // Check cache first
         let cache_key = format!("{}:{}", name, cmd_name);
-        if let Some(cached) = self.cache.get(&cache_key) {
+        if let Some(cached) = self.cache.lock().unwrap().get(&cache_key) {
             return Ok(cached.clone());
         }
 
@@ -129,7 +130,7 @@ impl ToolchainDiscovery {
                 detection_source: source,
             };
 
-            self.cache.insert(cache_key, Some(toolchain.clone()));
+            self.cache.lock().unwrap().insert(cache_key, Some(toolchain.clone()));
             return Ok(Some(toolchain));
         }
 
@@ -154,13 +155,13 @@ impl ToolchainDiscovery {
                     detection_source: source,
                 };
 
-                self.cache.insert(cache_key, Some(toolchain.clone()));
+                self.cache.lock().unwrap().insert(cache_key, Some(toolchain.clone()));
                 return Ok(Some(toolchain));
             }
         }
 
         // Cache negative result
-        self.cache.insert(cache_key, None);
+        self.cache.lock().unwrap().insert(cache_key, None);
         Ok(None)
     }
 
@@ -191,9 +192,8 @@ fn find_executable(name: &str) -> Option<PathBuf> {
         let output = Command::new("where").arg(name).output();
         if let Ok(output) = output {
             if output.status.success() {
-                let first_line = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .next()?;
+                let lossy = String::from_utf8_lossy(&output.stdout);
+                let first_line = lossy.lines().next()?;
                 return Some(PathBuf::from(first_line.trim()));
             }
         }

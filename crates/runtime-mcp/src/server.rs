@@ -1,13 +1,27 @@
 //! MCP server implementation
 //!
 //! Exposes YL Agent Runtime capabilities as MCP tools.
+//! Uses the official rmcp SDK (ADR-002), targeting rmcp 3.10.
+//
+//! rmcp 3.10 API notes:
+//!   - `get_info(&self) -> ServerConfig` (sync; `ServerInfo` renamed to `ServerConfig`)
+//!   - `#[tool_handler]` is applied to the `impl ServerHandler` block and
+//!     auto-generates `call_tool`, `list_tools`, `get_tool`, `get_info`.
+//!   - Individual tools are marked with `#[tool]` and receive deserialized
+//!     arguments through `Parameters<T>`.
+//!   - Tool return values must implement `IntoCallToolResult` (e.g.
+//!     `std::result::Result<CallToolResult, McpError>`).
 
-use rmcp::{ServerHandler, ServerInfo, ServerCapabilities, tool_handler};
-use rmcp::model::*;
-use runtime_core::error::{Error, Result};
+use rmcp::{
+    ServerHandler, tool, tool_handler, tool_router,
+    model::{CallToolResult, ContentBlock, JsonObject},
+    handler::server::wrapper::Parameters,
+};
+use rmcp::ErrorData as McpError;
+use runtime_core::traits::CapabilityGrant;
 use runtime_core::types::*;
+use std::result::Result;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// MCP server for YL Agent Runtime
 pub struct McpServer {
@@ -17,10 +31,14 @@ pub struct McpServer {
 /// Runtime service trait for MCP server to call
 #[async_trait::async_trait]
 pub trait RuntimeService: Send + Sync {
-    async fn get_status(&self) -> Result<RuntimeStatus>;
-    async fn get_capabilities(&self) -> Result<Vec<CapabilityGrant>>;
-    async fn list_workspaces(&self) -> Result<Vec<String>>;
-    async fn execute_command(&self, command: String, args: Vec<String>) -> Result<CommandResult>;
+    async fn get_status(&self) -> runtime_core::error::Result<RuntimeStatus>;
+    async fn get_capabilities(&self) -> runtime_core::error::Result<Vec<CapabilityGrant>>;
+    async fn list_workspaces(&self) -> runtime_core::error::Result<Vec<String>>;
+    async fn execute_command(
+        &self,
+        command: String,
+        args: Vec<String>,
+    ) -> runtime_core::error::Result<CommandResult>;
 }
 
 /// Runtime status
@@ -49,69 +67,115 @@ impl McpServer {
     }
 }
 
-#[async_trait::async_trait]
-impl ServerHandler for McpServer {
-    async fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            server: Implementation {
-                name: "yl-agent-runtime".to_string(),
-                version: Some("0.1.0".to_string()),
-            },
-            capabilities: ServerCapabilities::builder().build(),
-            instructions: Some("YL Agent Runtime - Portable agent execution runtime".to_string()),
-        }
+/// Tool routes exposed to MCP clients.
+///
+/// `#[tool_router]` generates `McpServer::tool_router()`, which is used by the
+/// `#[tool_handler]` impl below to route `tools/call` requests.
+#[tool_router]
+impl McpServer {
+    /// Report runtime status and capability summary.
+    #[tool(name = "runtime.status")]
+    async fn runtime_status(&self) -> Result<CallToolResult, McpError> {
+        let status = self
+            .runtime
+            .get_status()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string(&status).unwrap(),
+        )]))
     }
 
-    #[tool_handler]
-    async fn runtime_status(&self) -> Result<CallToolResult> {
-        let status = self.runtime.get_status().await.map_err(|e| {
-            rmcp::Error::internal(format!("{}", e))
-        })?;
-        Ok(CallToolResult::success(vec![
-            Content::text(serde_json::to_string(&status).unwrap())
-        ]))
+    /// Report available backend capabilities.
+    #[tool(name = "runtime.capabilities")]
+    async fn runtime_capabilities(&self) -> Result<CallToolResult, McpError> {
+        let caps = self
+            .runtime
+            .get_capabilities()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string(&caps).unwrap(),
+        )]))
     }
 
-    #[tool_handler]
-    async fn runtime_capabilities(&self) -> Result<CallToolResult> {
-        let caps = self.runtime.get_capabilities().await.map_err(|e| {
-            rmcp::Error::internal(format!("{}", e))
-        })?;
-        Ok(CallToolResult::success(vec![
-            Content::text(serde_json::to_string(&caps).unwrap())
-        ]))
+    /// List registered workspaces.
+    #[tool(name = "workspace.list")]
+    async fn workspace_list(&self) -> Result<CallToolResult, McpError> {
+        let workspaces = self
+            .runtime
+            .list_workspaces()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string(&workspaces).unwrap(),
+        )]))
     }
 
-    #[tool_handler]
-    async fn workspace_list(&self, args: workspace_list::Args) -> Result<CallToolResult> {
-        let _ = args;
-        let workspaces = self.runtime.list_workspaces().await.map_err(|e| {
-            rmcp::Error::internal(format!("{}", e))
-        })?;
-        Ok(CallToolResult::success(vec![
-            Content::text(serde_json::to_string(&workspaces).unwrap())
-        ]))
-    }
-
-    #[tool_handler]
-    async fn process_exec(&self, args: process_exec::Args) -> Result<CallToolResult> {
-        let result = self.runtime.execute_command(args.command, args.args.unwrap_or_default()).await
-            .map_err(|e| rmcp::Error::internal(format!("{}", e)))?;
-        Ok(CallToolResult::success(vec![
-            Content::text(serde_json::to_string(&result).unwrap())
-        ]))
+    /// Execute a command and wait for completion.
+    #[tool(
+        name = "process.exec",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string" },
+                        "command": { "type": "string" },
+                        "args": { "type": "array", "items": { "type": "string" } },
+                        "timeout_seconds": { "type": "integer" }
+                    },
+                    "required": ["project_id", "command"]
+                })
+            )
+            .expect("invalid process.exec input schema")
+        )
+    )]
+    async fn process_exec(
+        &self,
+        args: Parameters<process_exec::Args>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = args.0;
+        let result = self
+            .runtime
+            .execute_command(args.command, args.args.unwrap_or_default())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string(&result).unwrap(),
+        )]))
     }
 }
 
+/// `#[tool_handler]` wires the router into `ServerHandler` and generates
+/// `call_tool`, `list_tools`, `get_tool`, and `get_info`.
+///
+/// `get_info` is auto-generated from `name`/`version`/`instructions` and
+/// returns a `ServerConfig` advertising the tools capability.
+#[tool_handler(
+    name = "yl-agent-runtime",
+    version = "0.1.0",
+    instructions = "YL Agent Runtime - Portable agent execution runtime"
+)]
+impl ServerHandler for McpServer {
+    // Intentionally empty: `#[tool_handler]` generates the required
+    // `ServerHandler` methods (call_tool, list_tools, get_tool, get_info).
+}
+
+// ---------------------------------------------------------------------------
 // MCP tool argument types
+// ---------------------------------------------------------------------------
+
 pub mod workspace_list {
     use serde::{Deserialize, Serialize};
+
     #[derive(Debug, Deserialize, Serialize)]
     pub struct Args {}
 }
 
 pub mod process_exec {
     use serde::{Deserialize, Serialize};
+
     #[derive(Debug, Deserialize, Serialize)]
     pub struct Args {
         pub command: String,

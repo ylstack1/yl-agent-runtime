@@ -178,8 +178,9 @@ pub struct ConfigMigrator;
 impl ConfigMigrator {
     pub fn migrate(config: Config, target_version: &str) -> Result<(Config, MigrationResult)> {
         if config.version == target_version {
+            let from_version = config.version.clone();
             return Ok((config, MigrationResult {
-                from_version: config.version.clone(),
+                from_version,
                 to_version: target_version.to_string(),
                 migrated: false,
             }));
@@ -190,14 +191,15 @@ impl ConfigMigrator {
         let mut migrated = false;
 
         // Example migration: add new fields
-        if config.version < "0.2.0" {
+        if config.version < "0.2.0".to_string() {
             // Add any new fields introduced in 0.2.0
             migrated = true;
             config.version = "0.2.0".to_string();
         }
 
+        let from_version = config.version.clone();
         Ok((config, MigrationResult {
-            from_version: config.version.clone(),
+            from_version,
             to_version: target_version.to_string(),
             migrated,
         }))

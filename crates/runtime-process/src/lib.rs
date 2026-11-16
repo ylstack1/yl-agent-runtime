@@ -7,5 +7,6 @@ pub mod supervisor;
 pub mod limits;
 
 pub use service::ProcessService;
+pub use service::ProcessServiceOps;
 pub use supervisor::*;
 pub use limits::*;

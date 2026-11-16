@@ -32,8 +32,8 @@ pub fn test_session_id() -> SessionId {
 }
 
 /// Creates a test capability grant
-pub fn test_grant(capability: Capability) -> runtime_core::capability::CapabilityGrant {
-    runtime_core::capability::CapabilityGrant {
+pub fn test_grant(capability: Capability) -> runtime_core::CapabilityGrant {
+    runtime_core::CapabilityGrant {
         capability,
         decision: PolicyDecision::Allow,
         resource: None,
@@ -43,8 +43,8 @@ pub fn test_grant(capability: Capability) -> runtime_core::capability::Capabilit
 }
 
 /// Creates a test execution profile config
-pub fn test_profile_config(profile: ExecutionProfile) -> runtime_core::capability::ExecutionProfileConfig {
-    runtime_core::capability::ExecutionProfileConfig::get(profile)
+pub fn test_profile_config(profile: ExecutionProfile) -> runtime_core::ExecutionProfileConfig {
+    runtime_core::ExecutionProfileConfig::get(profile)
 }
 
 #[cfg(test)]

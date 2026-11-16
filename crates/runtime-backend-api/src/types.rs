@@ -1,5 +1,6 @@
 //! Backend API types
 
+use runtime_core::CapabilityGrant;
 use runtime_core::types::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -39,6 +40,7 @@ pub struct PreparedExecution {
 pub struct ProcessHandle {
     pub id: ProcessId,
     pub os_pid: u32,
+    pub status: ProcessStatus,
 }
 
 /// Process status

@@ -8,7 +8,8 @@ pub mod evaluator;
 pub mod profiles;
 pub mod store;
 
-pub use engine::PolicyEngine;
+pub use runtime_core::traits::PolicyEngine;
+pub use engine::PolicyEngineImpl;
 pub use evaluator::*;
 pub use profiles::*;
 pub use store::*;

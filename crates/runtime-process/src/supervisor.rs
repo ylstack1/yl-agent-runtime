@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Mapping of OS PID to child PIDs
-type ProcessTree = HashMap<u32, Vec<u32>>;
+/// Mapping of OS PID to its direct child PIDs
+type ProcessTree = Vec<u32>;
 
 /// Process tree supervisor
 #[derive(Clone)]

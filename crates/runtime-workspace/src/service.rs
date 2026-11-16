@@ -2,15 +2,14 @@
 //!
 //! Safe project discovery and file operations per PRD section 10.
 
-use crate::path_safety::{PathValidator, PathViolation};
+use crate::path_safety::PathValidator;
 use runtime_core::error::{Error, Result};
 use runtime_core::traits::WorkspaceService;
 use runtime_core::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 /// Registered workspace
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,15 +89,15 @@ impl WorkspaceService for WorkspaceServiceImpl {
             .with_root(canonical)
             .allow_symlinks(false);
 
-        self.workspaces.write().await.insert(id, workspace);
-        self.validators.write().await.insert(id, validator);
+        self.workspaces.write().unwrap().insert(id, workspace);
+        self.validators.write().unwrap().insert(id, validator);
 
         Ok(id)
     }
 
     async fn unregister(&self, project_id: ProjectId) -> Result<()> {
-        let removed = self.workspaces.write().await.remove(&project_id).is_some();
-        self.validators.write().await.remove(&project_id);
+        let removed = self.workspaces.write().unwrap().remove(&project_id).is_some();
+        self.validators.write().unwrap().remove(&project_id);
         if !removed {
             return Err(Error::WorkspaceNotFound(format!("Project {}", project_id)));
         }
@@ -146,7 +145,7 @@ impl WorkspaceService for WorkspaceServiceImpl {
             };
 
             entries.push(FileEntry {
-                path,
+                path: path.clone(),
                 name: entry.file_name().to_string_lossy().to_string(),
                 file_type,
                 size: metadata.len(),
@@ -185,7 +184,7 @@ impl WorkspaceService for WorkspaceServiceImpl {
         };
 
         Ok(FileEntry {
-            path: contained.absolute_path,
+            path: contained.absolute_path.clone(),
             name: contained.relative_path.to_string_lossy().to_string(),
             file_type,
             size: metadata.len(),
@@ -440,16 +439,16 @@ impl WorkspaceService for WorkspaceServiceImpl {
 }
 
 impl WorkspaceServiceImpl {
-    async fn get_workspace(&self, project_id: ProjectId) -> Result<RegisteredWorkspace> {
-        let workspaces = self.workspaces.read().await;
+    fn get_workspace(&self, project_id: ProjectId) -> Result<RegisteredWorkspace> {
+        let workspaces = self.workspaces.read().unwrap();
         workspaces
             .get(&project_id)
             .cloned()
             .ok_or_else(|| Error::WorkspaceNotFound(format!("Project {}", project_id)))
     }
 
-    async fn get_validator(&self, project_id: ProjectId) -> Result<PathValidator> {
-        let validators = self.validators.read().await;
+    fn get_validator(&self, project_id: ProjectId) -> Result<PathValidator> {
+        let validators = self.validators.read().unwrap();
         validators
             .get(&project_id)
             .cloned()
@@ -630,7 +629,10 @@ fn get_tree_recursive(
             Err(_) => continue,
         };
 
-        let relative = path.strip_prefix(root).unwrap_or(&path);
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_path_buf();
         let file_type = if metadata.is_dir() {
             FileType::Directory
         } else if path.is_symlink() {
@@ -640,7 +642,7 @@ fn get_tree_recursive(
         };
 
         entries.push(FileEntry {
-            path,
+            path: path.clone(),
             name: relative.to_string_lossy().to_string(),
             file_type,
             size: metadata.len(),

@@ -5,3 +5,4 @@
 pub mod service;
 
 pub use service::TerminalService;
+pub use service::TerminalServiceImpl;

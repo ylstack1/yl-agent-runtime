@@ -1,8 +1,10 @@
 //! Core traits for YL Agent Runtime
 
+use crate::audit::{AuditEvent, AuditFilter};
 use crate::error::Result;
 use crate::types::*;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 

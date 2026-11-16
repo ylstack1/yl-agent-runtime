@@ -8,7 +8,6 @@ use runtime_core::error::{Error, Result};
 use runtime_core::types::ProjectId;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// A validated, contained workspace path
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +67,7 @@ const SENSITIVE_DIRS: &[&str] = &[
 ];
 
 /// Path safety validator
+#[derive(Clone)]
 pub struct PathValidator {
     allowed_roots: Vec<PathBuf>,
     deny_paths: Vec<PathBuf>,
@@ -146,7 +146,11 @@ impl PathValidator {
         let normalized = normalize_path(user_path);
 
         // Check for path traversal after normalization
-        if normalized.starts_with("..") || normalized.contains("/..") || normalized.contains("\\..") {
+        let normalized_str = normalized.to_string_lossy();
+        if normalized_str.starts_with("..")
+            || normalized_str.contains("/..")
+            || normalized_str.contains("\\..")
+        {
             violations.push(PathViolation::PathTraversal);
             return Err(Error::PathEscape(format!("Path traversal detected: {:?}", user_path)));
         }
@@ -325,12 +329,13 @@ pub fn check_path_safety(user_path: &Path, allowed_roots: &[PathBuf]) -> PathVal
         violations.push(PathViolation::OutsideAllowedRoot);
     }
 
+    let relative_path = resolved_path.as_ref().and_then(|p| {
+        allowed_roots.iter().find_map(|root| p.strip_prefix(root).ok().map(|r| r.to_path_buf()))
+    });
     PathValidationResult {
         valid: violations.is_empty() && resolved_path.is_some(),
         resolved_path,
-        relative_path: resolved_path.as_ref().and_then(|p| {
-            allowed_roots.iter().find_map(|root| p.strip_prefix(root).ok().map(|r| r.to_path_buf()))
-        }),
+        relative_path,
         violations,
     }
 }

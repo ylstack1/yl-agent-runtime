@@ -25,4 +25,3 @@ rand_chacha = { workspace = true }
 async-trait = "0.1"
 runtime-core = { path = "../runtime-core" }
 runtime-config = { path = "../runtime-config" }
-runtime-audit = { path = "../runtime-audit" }

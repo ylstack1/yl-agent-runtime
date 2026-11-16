@@ -1,8 +1,9 @@
 //! Core type definitions for YL Agent Runtime
 
 use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
+pub use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -142,7 +143,7 @@ impl std::fmt::Display for ApprovalId {
 }
 
 /// Platform identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Platform {
     Windows,
@@ -165,7 +166,7 @@ impl Platform {
 }
 
 /// Architecture identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Architecture {
     X86_64,
@@ -294,7 +295,7 @@ pub enum ToolchainSource {
 }
 
 /// Capability names (standardized)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     WorkspaceRead,
@@ -549,3 +550,31 @@ impl EnforcementReport {
         !self.errors.is_empty()
     }
 }
+
+// JSON Schema support for the UUID-based identifier newtypes. schemars has no
+// built-in UUID schema, so each identifier serializes as a JSON string.
+macro_rules! impl_json_schema_for_uuid_newtype {
+    ($ty:ident) => {
+        impl JsonSchema for $ty {
+            fn schema_name() -> String {
+                stringify!($ty).to_string()
+            }
+            fn schema_id() -> std::borrow::Cow<'static, str> {
+                stringify!($ty).into()
+            }
+            fn json_schema(
+                _gen: &mut schemars::gen::SchemaGenerator,
+            ) -> schemars::schema::Schema {
+                String::json_schema(_gen)
+            }
+        }
+    }
+}
+
+impl_json_schema_for_uuid_newtype!(ProjectId);
+impl_json_schema_for_uuid_newtype!(AgentId);
+impl_json_schema_for_uuid_newtype!(DeviceId);
+impl_json_schema_for_uuid_newtype!(SessionId);
+impl_json_schema_for_uuid_newtype!(ProcessId);
+impl_json_schema_for_uuid_newtype!(TerminalId);
+impl_json_schema_for_uuid_newtype!(ApprovalId);

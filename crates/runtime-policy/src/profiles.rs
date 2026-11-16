@@ -1,6 +1,5 @@
 //! Execution profile definitions
 
-use runtime_core::capability::ExecutionProfileConfig;
 use runtime_core::types::ExecutionProfile;
 
 /// Re-export profile config from runtime-core

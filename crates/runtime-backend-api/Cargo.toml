@@ -17,5 +17,3 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"
 runtime-core = { path = "../runtime-core" }
-runtime-policy = { path = "../runtime-policy" }
-runtime-process = { path = "../runtime-process" }

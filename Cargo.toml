@@ -51,7 +51,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Configuration
 config = "0.14"
-figment = { version = "0.11", features = ["toml", "env", "serialize"] }
+figment = { version = "0.10", features = ["toml", "env"] }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid", "migrate"] }
@@ -60,41 +60,44 @@ sqlite = "0.37"
 # Cryptography
 ring = "0.17"
 ed25519-dalek = "2.1"
-x25519-dalek = "2.1"
+x25519-dalek = "3.0"
 blake3 = "1.5"
 zeroize = "1.7"
 rand = "0.8"
 rand_chacha = "0.3"
 
 # MCP
-rmcp = { version = "3.10", features = ["server", "transport-stdio", "transport-http"] }
+rmcp = { version = "3.10", features = ["server", "macros"] }
 
 # Transport
-iroh = { version = "1.4", features = ["net", "blobs", "docs", "discovery-n0"], optional = true }
+iroh = "1.4"
 
 # IPC
-tokio-util = { version = "0.7", features = ["codec", "io", "sync"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
 bytes = "1.5"
 
 # Platform detection
 target-lexicon = "0.12"
+# JSON Schema generation (used by runtime-protocol tool schemas)
+schemars = "0.8"
 
 # Testing
 tempfile = "3.10"
 proptest = "1.4"
+which = "6.0"
 
-# Windows-specific
-[target.'cfg(windows)'.workspace.dependencies]
+# Platform-specific dependencies (declared here so crate manifests can
+# reference them with { workspace = true }; each crate gates actual use via
+# #[cfg(target_os = "...")] in its source code).
 windows = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_System_JobObjects",
     "Win32_System_ProcessStatus",
-    "Win32_System_ProcessSnapshot",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Memory",
     "Win32_Security",
-    "Win32_System_Token",
+    "Win32_Security_Authorization",
     "Win32_System_Environment",
     "Win32_System_Console",
     "Win32_Storage_FileSystem",
@@ -105,46 +108,34 @@ windows = { version = "0.59", features = [
 ] }
 winreg = "0.11"
 conpty = "0.4"
-rappct = { version = "0.13", optional = true }
-
-# Linux-specific
-[target.'cfg(target_os = "linux")'.workspace.dependencies]
 libc = "0.2"
-nix = { version = "0.28", features = ["process", "sys", "signal", "fcntl", "pty", "unistd"] }
-landlock = "0.6"
-seccomp = "0.8"
-cgroups = "0.3"
-arapuca = { version = "0.2", optional = true }
-
-# macOS-specific
-[target.'cfg(target_os = "macos")'.workspace.dependencies]
-libc = "0.2"
-nix = { version = "0.28", features = ["process", "sys", "signal", "fcntl", "pty", "unistd"] }
+nix = "0.28"
+landlock = "0.4"
+seccomp = "0.1"
+cgroups = "0.1"
 core-foundation = "0.9"
 core-foundation-sys = "0.8"
 security-framework = "2.10"
-arapuca = { version = "0.2", optional = true }
 
 # PTY (cross-platform)
-portable-pty = { version = "0.9", features = ["conpty", "pty-system"] }
+portable-pty = "0.9"
 
-# Tauri (optional, for desktop app)
-tauri = { version = "2.0", features = ["tray-icon", "cli"], optional = true }
-tauri-plugin-shell = { version = "2.0", optional = true }
-tauri-plugin-fs = { version = "2.0", optional = true }
-tauri-plugin-dialog = { version = "2.0", optional = true }
-tauri-plugin-opener = { version = "2.0", optional = true }
-tauri-plugin-notification = { version = "2.0", optional = true }
+# Tauri (optional, for desktop app - excluded from workspace)
+tauri = { version = "2.0", features = ["tray-icon", "cli"] }
+tauri-plugin-shell = { version = "2.0" }
+tauri-plugin-fs = { version = "2.0" }
+tauri-plugin-dialog = { version = "2.0" }
+tauri-plugin-opener = { version = "2.0" }
+tauri-plugin-notification = { version = "2.0" }
 
-[workspace.lints]
-rust = "2021"
-clippy::all = "warn"
-clippy::pedantic = "warn"
-clippy::nursery = "warn"
-clippy::cargo = "warn"
-clippy::unwrap_used = "allow"
-clippy::expect_used = "allow"
-clippy::panic = "allow"
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+cargo = "warn"
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
 
 [profile.release]
 strip = true

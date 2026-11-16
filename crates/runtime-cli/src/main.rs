@@ -3,7 +3,6 @@
 //! Diagnostics, pairing, and administration per PRD section 6.2.
 
 use clap::Parser;
-use runtime_cli::commands;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[derive(Parser, Debug)]
