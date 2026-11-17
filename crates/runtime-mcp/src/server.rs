@@ -26,8 +26,9 @@ use rmcp::ErrorData as McpError;
 use runtime_audit::AuditService;
 use runtime_core::audit::{AuditEvent, AuditEventType};
 use runtime_core::error::Error;
-use runtime_core::traits::{CapabilityGrant, WorkspaceService};
+use runtime_core::traits::{CapabilityGrant, ExecutionRequest, TerminationMode, WorkspaceService};
 use runtime_core::types::*;
+use runtime_process::ProcessServiceOps;
 use runtime_workspace::WorkspaceServiceImpl;
 use runtime_workspace::files::edit::{EditOptions, EditSpec};
 use runtime_workspace::files::read::{ReadOptions, ReadOutcome};
@@ -36,14 +37,17 @@ use runtime_workspace::search::{FindOptions, SearchOptions};
 use crate::args::normalize_args;
 use crate::tools_fs::{
     AllowedRootsArgs, DeleteArgs, EditArgs, FindFilesArgs, invalid, ListArgs,
-    MkdirArgs, MoveArgs, output_json, PatchArgs, ProcessExecArgs, ReadArgs, ReplaceTextArgs,
+    MkdirArgs, MoveArgs, output_json, PatchArgs, ProcessExecArgs,
+    ProcessListArgs, ProcessReadArgs, ProcessStartArgs, ProcessStopArgs, ReadArgs, ReplaceTextArgs,
     resolve_project, SearchArgs, StatArgs, TreeArgs, TreeBudgetExceeded, walk_shallow, walk_tree,
     WriteArgs,
 };
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::result::Result;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// MCP server for YL Agent Runtime
 pub struct McpServer {
@@ -52,6 +56,7 @@ pub struct McpServer {
     roots: Vec<(ProjectId, PathBuf)>,       // ordered; roots[0] is primary for relative paths
     read_only_roots: Vec<PathBuf>,
     audit: Arc<dyn runtime_audit::AuditService>,
+    process_service: Arc<dyn ProcessServiceOps>,
     principal_agent: String,                // "mcp-local" (design decision 4)
     session_id: SessionId,                  // per-process synthetic session
 }
@@ -132,6 +137,7 @@ impl McpServer {
         roots: Vec<(ProjectId, PathBuf)>,
         audit: Arc<dyn AuditService>,
         read_only_roots: Vec<PathBuf>,
+        process_service: Arc<dyn ProcessServiceOps>,
     ) -> Self {
         Self {
             runtime: Arc::new(FsOnlyRuntime),
@@ -139,6 +145,7 @@ impl McpServer {
             roots,
             read_only_roots,
             audit,
+            process_service,
             principal_agent: "mcp-local".to_string(),
             session_id: SessionId::new(),
         }
@@ -282,6 +289,254 @@ impl McpServer {
             .await
             .map_err(Self::map_runtime_error)?;
         output_json(&result)
+    }
+
+    /// Spawn a process and return a handle.
+    #[tool(
+        name = "process.start",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string" },
+                        "program": { "type": "string" },
+                        "args": { "type": "array", "items": { "type": "string" } },
+                        "cwd": { "type": "string" },
+                        "timeout_seconds": { "type": "integer" }
+                    },
+                    "required": ["project_id", "program"]
+                })
+            )
+            .expect("invalid process.start input schema")
+        )
+    )]
+    async fn process_start(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("process.start", &args.0)?;
+        let args: ProcessStartArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+
+        if self.roots.is_empty() {
+            return Err(invalid("No workspace roots configured"));
+        }
+
+        let project_id = Uuid::parse_str(&args.project_id)
+            .map_err(|e| invalid(format!("invalid project_id: {e}")))?;
+        let project_id = ProjectId(project_id);
+
+        let root = self
+            .roots
+            .iter()
+            .find(|(pid, _)| *pid == project_id)
+            .map(|(_, path)| path.clone())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "project_id not found in roots: {}",
+                    args.project_id
+                ))
+            })?;
+
+        let cwd = match &args.cwd {
+            Some(c) => root.join(c),
+            None => root,
+        };
+
+        let request = ExecutionRequest {
+            id: ProcessId::new(),
+            session_id: self.session_id,
+            project_id,
+            agent_id: AgentId(Uuid::nil()),
+            executable: PathBuf::from(&args.program),
+            arguments: args.args.unwrap_or_default(),
+            environment: HashMap::new(),
+            working_directory: cwd,
+            profile: ExecutionProfile::Development,
+            capabilities: vec![],
+            max_runtime_seconds: args.timeout_seconds,
+            max_processes: None,
+            memory_limit_mb: None,
+            stdin_data: None,
+        };
+
+        let handle = self
+            .process_service
+            .start(request)
+            .await
+            .map_err(Self::map_runtime_error)?;
+
+        self.record_audit(
+            AuditEventType::ProcessStart,
+            Some(project_id),
+            Some(args.program.clone()),
+        )
+        .await;
+
+        output_json(&json!({
+            "process_id": handle.id.to_string(),
+            "pid": handle.os_pid,
+            "running": handle.status.running,
+            "exit_code": handle.status.exit_status.as_ref().and_then(|s| s.code),
+            "started_at": handle.status.started_at.to_rfc3339(),
+        }))
+    }
+
+    /// Read process output (cursor-paged log read).
+    #[tool(
+        name = "process.read",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "process_id": { "type": "string" },
+                        "after": { "type": "integer" },
+                        "limit_bytes": { "type": "integer" },
+                        "wait_ms": { "type": "integer" }
+                    },
+                    "required": ["process_id"]
+                })
+            )
+            .expect("invalid process.read input schema")
+        )
+    )]
+    async fn process_read(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("process.read", &args.0)?;
+        let args: ProcessReadArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+
+        let process_id = Uuid::parse_str(&args.process_id)
+            .map_err(|e| invalid(format!("invalid process_id: {e}")))?;
+        let process_id = ProcessId(process_id);
+
+        let output = self
+            .process_service
+            .output(process_id)
+            .await
+            .map_err(Self::map_runtime_error)?;
+
+        output_json(&json!({
+            "process_id": args.process_id,
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+            "exit_status": output.exit_status,
+            "truncated": output.truncated,
+        }))
+    }
+
+    /// Terminate a running process.
+    #[tool(
+        name = "process.stop",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "process_id": { "type": "string" },
+                        "force": { "type": "boolean" }
+                    },
+                    "required": ["process_id"]
+                })
+            )
+            .expect("invalid process.stop input schema")
+        )
+    )]
+    async fn process_stop(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("process.stop", &args.0)?;
+        let args: ProcessStopArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+
+        let process_id = Uuid::parse_str(&args.process_id)
+            .map_err(|e| invalid(format!("invalid process_id: {e}")))?;
+        let process_id = ProcessId(process_id);
+
+        let mode = if args.force.unwrap_or(false) {
+            TerminationMode::Force
+        } else {
+            TerminationMode::Graceful
+        };
+
+        self.process_service
+            .terminate(process_id, mode)
+            .await
+            .map_err(Self::map_runtime_error)?;
+
+        self.record_audit(
+            AuditEventType::ProcessTerminate,
+            None,
+            Some(args.process_id.clone()),
+        )
+        .await;
+
+        output_json(&json!({ "stopped": true, "process_id": args.process_id }))
+    }
+
+    /// List running processes.
+    #[tool(
+        name = "process.list",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string" }
+                    },
+                    "required": []
+                })
+            )
+            .expect("invalid process.list input schema")
+        )
+    )]
+    async fn process_list(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("process.list", &args.0)?;
+        let _args: ProcessListArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+
+        let processes = self
+            .process_service
+            .list()
+            .await
+            .map_err(Self::map_runtime_error)?;
+
+        self.record_audit(AuditEventType::ProcessList, None, None).await;
+
+        let values: Vec<serde_json::Value> = processes
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "process_id": p.id.to_string(),
+                    "pid": p.os_pid,
+                    "running": p.running,
+                    "exit_code": p.exit_status.as_ref().and_then(|s| s.code),
+                })
+            })
+            .collect();
+
+        output_json(&json!({ "processes": values }))
+    }
+
+    /// Discover installed toolchains.
+    #[tool(
+        name = "process.discover_tools",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({ "type": "object", "properties": {}, "required": [] })
+            )
+            .expect("invalid process.discover_tools input schema")
+        )
+    )]
+    async fn process_discover_tools(
+        &self,
+        _args: Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let tools = vec![
+            "cargo", "rustc", "rustup", "git", "node", "bun", "python", "python3",
+            "py", "go", "dotnet", "cmake", "ninja", "java", "javac",
+        ];
+        output_json(&json!({ "tools": tools }))
     }
 
     /// Read a file's text content.
@@ -1025,11 +1280,14 @@ mod tests {
             .await
             .expect("register workspace");
         let audit = Arc::new(AuditServiceImpl::new());
+        let process_service: Arc<dyn ProcessServiceOps> =
+            Arc::new(runtime_process::ProcessService::new());
         let server = McpServer::new_for_fs(
             fs,
             vec![(id, dir.path().to_path_buf())],
             audit.clone(),
             vec![],
+            process_service,
         );
         (server, dir, audit)
     }
@@ -1155,11 +1413,14 @@ mod tests {
             .await
             .expect("register workspace");
         let audit = Arc::new(AuditServiceImpl::new());
+        let process_service: Arc<dyn ProcessServiceOps> =
+            Arc::new(runtime_process::ProcessService::new());
         let server = McpServer::new_for_fs(
             fs,
             vec![(id, dir.path().to_path_buf())],
             audit,
             vec![dir.path().to_path_buf()],
+            process_service,
         );
         let result = server
             .workspace_allowed_roots(Parameters(obj(json!({}))))
@@ -1301,7 +1562,9 @@ mod tests {
     async fn zero_roots_rejected() {
         let fs = Arc::new(WorkspaceServiceImpl::new());
         let audit = Arc::new(AuditServiceImpl::new());
-        let server = McpServer::new_for_fs(fs, vec![], audit, vec![]);
+        let process_service: Arc<dyn ProcessServiceOps> =
+            Arc::new(runtime_process::ProcessService::new());
+        let server = McpServer::new_for_fs(fs, vec![], audit, vec![], process_service);
         let err = server
             .workspace_read(Parameters(obj(json!({"path": "a.txt"}))))
             .await

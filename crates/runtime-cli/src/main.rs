@@ -47,6 +47,19 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Execute a command in a workspace
+    Exec {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        program: String,
+        #[arg(long)]
+        args: Vec<String>,
+        #[arg(long)]
+        approve: bool,
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
 }
 
 mod commands;
@@ -94,6 +107,15 @@ async fn main() -> anyhow::Result<()> {
                 config,
             })
             .await?;
+        }
+        Commands::Exec {
+            project,
+            program,
+            args,
+            approve,
+            timeout,
+        } => {
+            commands::exec_command(&project, &program, args, approve, timeout).await?;
         }
     }
     Ok(())

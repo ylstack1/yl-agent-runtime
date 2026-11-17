@@ -3,12 +3,16 @@
 use anyhow::Result;
 use runtime_audit::{AuditService, AuditServiceImpl};
 use runtime_config::Config;
+use runtime_core::traits::ExecutionRequest;
 use runtime_core::types::*;
+use runtime_process::{ProcessService, ProcessServiceOps};
 use runtime_toolchain::ToolchainDiscovery;
 use runtime_workspace::{SensitiveMatcher, WorkspaceService, WorkspaceServiceImpl};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
+use uuid::Uuid;
 
 pub async fn start_daemon(config_path: &str) {
     info!("Starting daemon with config: {}", config_path);
@@ -81,6 +85,54 @@ pub async fn revoke_device(device_id: &str) {
 pub async fn register_workspace(path: &str) {
     println!("Registering workspace: {}", path);
     // Would use WorkspaceService
+}
+
+/// Execute a command in a workspace via the process service.
+pub async fn exec_command(
+    project: &str,
+    program: &str,
+    args: Vec<String>,
+    approve: bool,
+    timeout: Option<u64>,
+) -> Result<()> {
+    if !approve {
+        return Err(anyhow::anyhow!(
+            "--approve is required to execute commands"
+        ));
+    }
+
+    let project_id =
+        Uuid::parse_str(project).map_err(|e| anyhow::anyhow!("invalid project id: {e}"))?;
+    let project_id = ProjectId(project_id);
+
+    let process_service = ProcessService::new();
+    let request = ExecutionRequest {
+        id: ProcessId::new(),
+        session_id: SessionId::new(),
+        project_id,
+        agent_id: AgentId(Uuid::nil()),
+        executable: PathBuf::from(program),
+        arguments: args,
+        environment: HashMap::new(),
+        working_directory: std::env::current_dir()?,
+        profile: ExecutionProfile::Development,
+        capabilities: vec![],
+        max_runtime_seconds: timeout,
+        max_processes: None,
+        memory_limit_mb: None,
+        stdin_data: None,
+    };
+
+    let handle = process_service.exec(request).await?;
+    println!("Process ID: {}", handle.id);
+    println!("OS PID: {}", handle.os_pid);
+    println!("Running: {}", handle.status.running);
+    if let Some(ref exit_status) = handle.status.exit_status {
+        println!("Exit code: {:?}", exit_status.code);
+        println!("Success: {}", exit_status.success);
+    }
+
+    Ok(())
 }
 
 /// Options for `yl mcp`.
@@ -175,7 +227,15 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
         Arc::new(AuditServiceImpl::new().with_log_path(config.data_dir.join("audit.jsonl")));
 
     // 6. Build the MCP server (Task 11 `new_for_fs`).
-    let mcp_server = runtime_mcp::McpServer::new_for_fs(service, roots_pairs, audit, server_read_only_roots);
+    let process_service: Arc<dyn runtime_process::ProcessServiceOps> =
+        Arc::new(runtime_process::ProcessService::new());
+    let mcp_server = runtime_mcp::McpServer::new_for_fs(
+        service,
+        roots_pairs,
+        audit,
+        server_read_only_roots,
+        process_service,
+    );
 
     // 7. Serve over stdio.
     use rmcp::ServiceExt;

@@ -52,6 +52,35 @@ pub const ALIASES: &[(&str, &[(&str, &str)])] = &[
     ("workspace.delete", &[("path", "paths"), ("files", "paths")]),
     ("workspace.read", &[("start", "line_start"), ("end", "line_end")]),
     ("workspace.stat", &[("file", "path"), ("target", "path")]),
+    (
+        "process.start",
+        &[
+            ("cmd", "program"),
+            ("exe", "program"),
+            ("executable", "program"),
+            ("arguments", "args"),
+            ("argv", "args"),
+            ("working_dir", "cwd"),
+            ("directory", "cwd"),
+            ("timeout", "timeout_seconds"),
+        ],
+    ),
+    (
+        "process.read",
+        &[
+            ("id", "process_id"),
+            ("pid", "process_id"),
+            ("cursor", "after"),
+            ("after_cursor", "after"),
+            ("limit", "limit_bytes"),
+            ("max_bytes", "limit_bytes"),
+            ("wait", "wait_ms"),
+            ("timeout", "wait_ms"),
+        ],
+    ),
+    ("process.stop", &[("id", "process_id"), ("pid", "process_id"), ("kill", "force")]),
+    ("process.list", &[]),
+    ("process.discover_tools", &[]),
 ];
 
 /// Required arguments per tool (PRD §13.1 names are canonical).
@@ -68,6 +97,12 @@ pub const REQUIRED: &[(&str, &[&str])] = &[
     ("workspace.move", &["source", "destination"]),
     ("workspace.delete", &["paths"]),
     ("workspace.stat", &["path"]),
+    ("process.exec", &["project_id", "command"]),
+    ("process.start", &["project_id", "program"]),
+    ("process.read", &["process_id"]),
+    ("process.stop", &["process_id"]),
+    ("process.list", &[]),
+    ("process.discover_tools", &[]),
 ];
 
 /// Base (struct-field) argument keys per tool, used for unknown-key detection
@@ -121,6 +156,11 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("workspace.delete", &["paths", "recursive"]),
     ("workspace.allowed_roots", &[]),
     ("process.exec", &["project_id", "command", "args", "timeout_seconds"]),
+    ("process.start", &["project_id", "program", "args", "cwd", "timeout_seconds"]),
+    ("process.read", &["process_id", "after", "limit_bytes", "wait_ms"]),
+    ("process.stop", &["process_id", "force"]),
+    ("process.list", &["project_id"]),
+    ("process.discover_tools", &[]),
 ];
 
 /// Base keys plus every alias canonical target (post-normalization names such

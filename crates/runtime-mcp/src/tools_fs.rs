@@ -256,6 +256,48 @@ pub struct ProcessExecArgs {
     pub timeout_seconds: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ProcessStartArgs {
+    #[allow(dead_code)]
+    pub project_id: String,
+    pub program: String,
+    #[allow(dead_code)]
+    pub args: Option<Vec<String>>,
+    #[allow(dead_code)]
+    pub cwd: Option<String>,
+    #[allow(dead_code)]
+    pub timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProcessReadArgs {
+    #[allow(dead_code)]
+    pub process_id: String,
+    #[allow(dead_code)]
+    pub after: Option<u64>,
+    #[allow(dead_code)]
+    pub limit_bytes: Option<u64>,
+    #[allow(dead_code)]
+    pub wait_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProcessStopArgs {
+    #[allow(dead_code)]
+    pub process_id: String,
+    #[allow(dead_code)]
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProcessListArgs {
+    #[allow(dead_code)]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProcessDiscoverToolsArgs {}
+
 // ---------------------------------------------------------------------------
 // Tree walking
 // ---------------------------------------------------------------------------

@@ -20,10 +20,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rmcp = { workspace = true, features = ["transport-io"] }
+uuid = { workspace = true }
 runtime-core = { path = "../runtime-core" }
 runtime-config = { path = "../runtime-config" }
 runtime-identity = { path = "../runtime-identity" }
 runtime-daemon = { path = "../runtime-daemon" }
+runtime-process = { path = "../runtime-process" }
 runtime-workspace = { path = "../runtime-workspace" }
 runtime-mcp = { path = "../runtime-mcp" }
 runtime-audit = { path = "../runtime-audit" }
