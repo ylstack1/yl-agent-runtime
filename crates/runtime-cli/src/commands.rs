@@ -2,7 +2,8 @@
 
 use anyhow::Result;
 use axum::Router;
-use axum::http::{HeaderName, HeaderValue, Method};
+use axum::http::{HeaderName, Method};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use runtime_audit::{AuditService, AuditServiceImpl};
 use runtime_config::Config;
 use runtime_core::traits::ExecutionRequest;
@@ -14,7 +15,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
 use tracing::info;
 use uuid::Uuid;
 
@@ -379,6 +379,8 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
     let app = Router::new().nest_service("/mcp", mcp_service);
 
     // CORS + origin validation (spec-mandated for DNS rebinding protection).
+    // Allow any origin for local development; mirror request origin for
+    // mobile/mobile clients that send specific Origin headers.
     let app = app.layer(
         CorsLayer::new()
             .allow_methods([Method::POST, Method::OPTIONS])
@@ -386,8 +388,9 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
                 HeaderName::from_static("content-type"),
                 HeaderName::from_static("mcp-session-id"),
                 HeaderName::from_static("accept"),
+                HeaderName::from_static("origin"),
             ])
-            .allow_origin("null".parse::<HeaderValue>().unwrap())
+            .allow_origin(AllowOrigin::mirror_request())
             .allow_credentials(false),
     );
 
