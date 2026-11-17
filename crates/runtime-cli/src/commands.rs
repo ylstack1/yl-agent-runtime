@@ -379,8 +379,8 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
     let app = Router::new().nest_service("/mcp", mcp_service);
 
     // CORS + origin validation (spec-mandated for DNS rebinding protection).
-    // Allow any origin for local development; mirror request origin for
-    // mobile/mobile clients that send specific Origin headers.
+    // Allow any origin for local development; works with Android MCP clients
+    // that send specific Origin headers.
     let app = app.layer(
         CorsLayer::new()
             .allow_methods([Method::POST, Method::OPTIONS])
@@ -390,7 +390,7 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
                 HeaderName::from_static("accept"),
                 HeaderName::from_static("origin"),
             ])
-            .allow_origin(AllowOrigin::mirror_request())
+            .allow_origin(AllowOrigin::any())
             .allow_credentials(false),
     );
 
