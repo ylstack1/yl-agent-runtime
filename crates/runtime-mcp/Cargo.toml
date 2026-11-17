@@ -30,3 +30,11 @@ runtime-approval = { path = "../runtime-approval" }
 runtime-audit = { path = "../runtime-audit" }
 runtime-config = { path = "../runtime-config" }
 base64 = { workspace = true }
+
+# Phase 1 toolset: gitignore-aware walking and glob matching for
+# workspace.list / workspace.tree.
+ignore = { workspace = true }
+globset = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
