@@ -1,6 +1,8 @@
 //! CLI command implementations
 
 use anyhow::Result;
+use axum::Router;
+use axum::http::{HeaderName, HeaderValue, Method};
 use runtime_audit::{AuditService, AuditServiceImpl};
 use runtime_config::Config;
 use runtime_core::traits::ExecutionRequest;
@@ -9,8 +11,10 @@ use runtime_process::{ProcessService, ProcessServiceOps};
 use runtime_toolchain::ToolchainDiscovery;
 use runtime_workspace::{SensitiveMatcher, WorkspaceService, WorkspaceServiceImpl};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
 use tracing::info;
 use uuid::Uuid;
 
@@ -254,4 +258,150 @@ fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
+}
+
+/// Run the MCP server over Streamable HTTP (remote access).
+///
+/// Pinned behavior:
+/// 1. Load config: `--config` path if given (error if unreadable), else
+///    `./config/runtime.toml` when it exists, else `Config::default()`.
+/// 2. Merge roots: CLI `--root` replaces config roots when non-empty;
+///    read-only roots append. Every root is canonicalized and must exist.
+/// 3. Fail closed: zero roots → message on stderr + exit(1).
+/// 4. Build `WorkspaceServiceImpl`, set the sensitive matcher, register each
+///    root (`Development`) / read-only root (`Inspect`).
+/// 5. Build `AuditServiceImpl` logging to `config.data_dir.join("audit.jsonl")`.
+/// 6. Build `McpServer::new_for_fs(...)` (Task 11 constructor skeleton).
+/// 7. Mount `StreamableHttpService` on an axum router at `/mcp` with origin
+///    validation (DNS rebinding protection) and bind to TCP.
+/// 8. Default bind address is 127.0.0.1 (localhost only); pass
+///    `--allow-remote` to bind 0.0.0.0.
+pub async fn run_http_server(host: String, port: u16, allow_remote: bool) -> Result<()> {
+    // 1. Load config.
+    let config = match std::env::var("YL_RUNTIME_CONFIG").ok() {
+        Some(path) if !path.is_empty() => Config::load_from_file(&PathBuf::from(path))?,
+        _ => {
+            let default_path = PathBuf::from("./config/runtime.toml");
+            if default_path.exists() {
+                Config::load_from_file(&default_path)?
+            } else {
+                Config::default()
+            }
+        }
+    };
+
+    // 2. Merge roots: CLI `--root` replaces config roots when non-empty;
+    //    read-only roots append. Every root is canonicalized and must exist.
+    let cli_roots: Vec<PathBuf> = vec![];
+    let roots: Vec<PathBuf> = if cli_roots.is_empty() {
+        config.workspace.roots.clone()
+    } else {
+        cli_roots
+    };
+    let mut read_only_roots: Vec<PathBuf> = vec![];
+    read_only_roots.extend(config.workspace.read_only_roots.clone());
+
+    // Canonicalize + existence-check every root.
+    let check_root = |p: &PathBuf| -> Result<PathBuf> {
+        let canonical = std::fs::canonicalize(p)
+            .map_err(|_| anyhow::anyhow!("Workspace root does not exist: {}", p.display()))?;
+        Ok(strip_verbatim_prefix(&canonical))
+    };
+    let roots: Vec<PathBuf> = roots.iter().map(check_root).collect::<Result<_>>()?;
+    let read_only_roots: Vec<PathBuf> =
+        read_only_roots.iter().map(check_root).collect::<Result<_>>()?;
+
+    // 3. Fail closed: no workspace roots at all.
+    if roots.is_empty() && read_only_roots.is_empty() {
+        eprintln!(
+            "No workspace roots configured. Pass --root <dir> (repeatable) or set [workspace] roots in your config."
+        );
+        std::process::exit(1);
+    }
+
+    info!("Workspace roots: {:?}", roots);
+    info!("Read-only roots: {:?}", read_only_roots);
+
+    // 4. Build the workspace service and register roots.
+    let service = Arc::new(WorkspaceServiceImpl::new());
+    service.set_sensitive(SensitiveMatcher::new());
+    let mut roots_pairs: Vec<(ProjectId, PathBuf)> = Vec::new();
+    for root in roots {
+        let id = service
+            .register(root.clone(), ExecutionProfile::Development)
+            .await?;
+        roots_pairs.push((id, root));
+    }
+    let server_read_only_roots = read_only_roots.clone();
+    for root in read_only_roots {
+        let id = service.register(root.clone(), ExecutionProfile::Inspect).await?;
+        roots_pairs.push((id, root));
+    }
+
+    // 5. Build the audit service, creating the data directory if missing.
+    std::fs::create_dir_all(&config.data_dir)?;
+    let audit: Arc<dyn AuditService> =
+        Arc::new(AuditServiceImpl::new().with_log_path(config.data_dir.join("audit.jsonl")));
+
+    // 6. Build the MCP server (Task 11 `new_for_fs`).
+    let process_service: Arc<dyn runtime_process::ProcessServiceOps> =
+        Arc::new(runtime_process::ProcessService::new());
+    let mcp_server = Arc::new(runtime_mcp::McpServer::new_for_fs(
+        service,
+        roots_pairs,
+        audit,
+        server_read_only_roots,
+        process_service,
+    ));
+
+    // 7. Serve over Streamable HTTP.
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false) // stateless for 2026-07-28
+        .with_json_response(true)        // plain JSON replies (simpler than SSE)
+        .with_allowed_hosts(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ]);
+
+    let mcp_server_clone = mcp_server.clone();
+    let mcp_service = StreamableHttpService::new(
+        move || Ok(mcp_server_clone.clone()),
+        LocalSessionManager::default().into(),
+        config,
+    );
+
+    // Build axum router with the MCP service mounted at /mcp.
+    let app = Router::new().nest_service("/mcp", mcp_service);
+
+    // CORS + origin validation (spec-mandated for DNS rebinding protection).
+    let app = app.layer(
+        CorsLayer::new()
+            .allow_methods([Method::POST, Method::OPTIONS])
+            .allow_headers([
+                HeaderName::from_static("content-type"),
+                HeaderName::from_static("mcp-session-id"),
+                HeaderName::from_static("accept"),
+            ])
+            .allow_origin("null".parse::<HeaderValue>().unwrap())
+            .allow_credentials(false),
+    );
+
+    let addr: SocketAddr = if allow_remote {
+        format!("0.0.0.0:{}", port).parse()?
+    } else {
+        format!("{}:{}", host, port).parse()?
+    };
+
+    info!("YL Agent Runtime MCP HTTP server listening on http://{}", addr);
+    info!("MCP endpoint: http://{}/mcp", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }

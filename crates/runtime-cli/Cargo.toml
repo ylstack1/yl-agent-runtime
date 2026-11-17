@@ -19,7 +19,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-rmcp = { workspace = true, features = ["transport-io"] }
+rmcp = { workspace = true, features = ["transport-io", "transport-streamable-http-server"] }
 uuid = { workspace = true }
 runtime-core = { path = "../runtime-core" }
 runtime-config = { path = "../runtime-config" }
@@ -30,6 +30,8 @@ runtime-workspace = { path = "../runtime-workspace" }
 runtime-mcp = { path = "../runtime-mcp" }
 runtime-audit = { path = "../runtime-audit" }
 runtime-toolchain = { path = "../runtime-toolchain" }
+axum = { workspace = true }
+tower-http = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

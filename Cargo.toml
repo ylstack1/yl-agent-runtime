@@ -67,10 +67,14 @@ rand = "0.8"
 rand_chacha = "0.3"
 
 # MCP
-rmcp = { version = "3.10", features = ["server", "macros"] }
+rmcp = { version = "3.10", features = ["server", "macros", "transport-streamable-http-server"] }
 
 # Transport
 iroh = "1.4"
+
+# HTTP transport (Streamable HTTP MCP)
+axum = "0.8"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # IPC
 tokio-util = { version = "0.7", features = ["codec", "io"] }
