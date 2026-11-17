@@ -1,0 +1,14 @@
+{
+  "$schema": "opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "yl-runtime": {
+        "type": "local",
+        "command": ["target/debug/yl.exe", "mcp", "--root", "."],
+        "cwd": ".",
+        "environment": {},
+        "disabled": false
+      }
+    }
+  }
+}
