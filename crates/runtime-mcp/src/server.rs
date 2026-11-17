@@ -1230,6 +1230,12 @@ impl McpServer {
         self.enforce_tool(Capability::WorkspaceWrite, Some(&path.display().to_string()))
             .await?;
 
+        // Capture old content before editing (for undo).
+        let old_content = self.fs.read_text(project_id, &path, &ReadOptions::default()).await.ok().and_then(|outcome| match outcome {
+            runtime_workspace::files::read::ReadOutcome::Text(t) => Some(t.content),
+            _ => None,
+        });
+
         let dry_run = args.dry_run.unwrap_or(false);
         let edits: Vec<EditSpec> = args
             .into_specs()
@@ -1257,6 +1263,25 @@ impl McpServer {
             Some(path.display().to_string()),
         )
         .await;
+
+        // Record undo entry.
+        let new_content = self.fs.read_text(project_id, &path, &ReadOptions::default()).await.ok().and_then(|outcome| match outcome {
+            runtime_workspace::files::read::ReadOutcome::Text(t) => Some(t.content),
+            _ => None,
+        });
+        let entry = runtime_undo::UndoJournalEntry {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            operation: runtime_undo::UndoOperation::Edit,
+            path: path.clone(),
+            old_content,
+            new_content,
+            old_path: None,
+            new_path: None,
+            commit_hash: None,
+        };
+        self.undo_journal.record(entry).await;
+
         output_json(&json!({
             "applied_edits": outcome.applied_edits,
             "diff": outcome.diff,
@@ -2016,7 +2041,16 @@ impl McpServer {
                             .map(|(id, _)| *id)
                             .ok_or_else(|| "no workspace root".to_string())?;
                         self.fs
-                            .write_text(project_id, &entry.path, content, &Default::default())
+                            .write_text(
+                                project_id,
+                                &entry.path,
+                                content,
+                                &WriteOptions {
+                                    overwrite: true,
+                                    append: false,
+                                    want_diff: false,
+                                },
+                            )
                             .await
                             .map_err(|e| format!("failed to restore content: {e}"))?;
                     }
@@ -2043,7 +2077,16 @@ impl McpServer {
                             .map(|(id, _)| *id)
                             .ok_or_else(|| "no workspace root".to_string())?;
                         self.fs
-                            .write_text(project_id, &entry.path, content, &Default::default())
+                            .write_text(
+                                project_id,
+                                &entry.path,
+                                content,
+                                &WriteOptions {
+                                    overwrite: true,
+                                    append: false,
+                                    want_diff: false,
+                                },
+                            )
                             .await
                             .map_err(|e| format!("failed to recreate file: {e}"))?;
                     }
@@ -2107,7 +2150,16 @@ impl McpServer {
                             .map(|(id, _)| *id)
                             .ok_or_else(|| "no workspace root".to_string())?;
                         self.fs
-                            .write_text(project_id, &entry.path, content, &Default::default())
+                            .write_text(
+                                project_id,
+                                &entry.path,
+                                content,
+                                &WriteOptions {
+                                    overwrite: true,
+                                    append: false,
+                                    want_diff: false,
+                                },
+                            )
                             .await
                             .map_err(|e| format!("failed to reapply content: {e}"))?;
                     }
