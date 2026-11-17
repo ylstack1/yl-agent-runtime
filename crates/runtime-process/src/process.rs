@@ -11,8 +11,7 @@
 
 use runtime_core::error::{Error, Result};
 use regex::Regex;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -113,16 +112,27 @@ impl ProcessExecutor {
         // 3. Environment security: deny-check every caller var, then whitelist.
         let env = self.build_env()?;
 
-        // Command hash for the spill directory name.
-        let mut hasher = DefaultHasher::new();
-        program.hash(&mut hasher);
+        // Command hash for the spill directory name: sha256 hex of the
+        // canonicalized command string (program + args + cwd), for consistency
+        // with the read engine's sha256-based content addressing.
+        let mut command_string = program.to_string();
         for arg in args {
-            arg.hash(&mut hasher);
+            command_string.push('\0');
+            command_string.push_str(arg);
         }
         if let Some(cwd) = cwd {
-            cwd.hash(&mut hasher);
+            command_string.push('\0');
+            command_string.push_str(cwd.to_string_lossy().as_ref());
         }
-        let command_hash = format!("{:x}", hasher.finish());
+        let command_hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(command_string.as_bytes());
+            let bytes = hasher.finalize();
+            bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        };
 
         // 4. Spawn (direct argv, piped output, cleared + whitelisted env).
         let mut cmd = Command::new(&exe);
