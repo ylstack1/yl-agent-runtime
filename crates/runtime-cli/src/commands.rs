@@ -434,8 +434,45 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
         }
     }
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // Very common in practice: a previous `yl serve` (possibly started
+            // from another terminal) is still holding the port. A raw
+            // "os error 10048" tells the user nothing, so say what is wrong and
+            // what to do.
+            let occupied = port_is_open(port).await;
+            let mut message = format!("port {port} is already in use");
+            if occupied {
+                message.push_str(
+                    " by a listening process — most likely a `yl serve` you started \
+                     earlier. If that is your runtime it is already up:\n",
+                );
+                message.push_str(&format!("  http://127.0.0.1:{port}/mcp\n"));
+                if accept_any_host {
+                    if let Some(ip) = local_lan_ip() {
+                        message.push_str(&format!("  http://{ip}:{port}/mcp  (LAN)\n"));
+                    }
+                }
+                message.push_str("Stop the other instance before starting a new one.");
+            } else {
+                message.push_str(
+                    " by another program. Pick a different port with --port <n>.",
+                );
+            }
+            anyhow::bail!("{message}");
+        }
+        Err(e) => return Err(e.into()),
+    };
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Is anything listening on `port`? Used only to explain an address-in-use
+/// error, never on the startup path.
+async fn port_is_open(port: u16) -> bool {
+    tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_ok()
 }
