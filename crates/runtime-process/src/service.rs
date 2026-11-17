@@ -2,6 +2,7 @@
 
 use crate::limits::ResourceLimits;
 use crate::supervisor::ProcessTreeSupervisor;
+use crate::{ProcessExecutor, resolve_executable};
 use runtime_core::error::{Error, Result};
 use runtime_core::traits::*;
 use runtime_core::types::*;
@@ -112,21 +113,34 @@ impl ProcessServiceOps for ProcessService {
     }
 
     async fn start(&self, request: ExecutionRequest) -> Result<ProcessHandle> {
-        // Validate executable path
-        if !request.executable.exists() {
-            return Err(Error::ToolchainNotFound(format!(
-                "Executable not found: {:?}",
-                request.executable
+        let program = request
+            .executable
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        // Executable allowlist (name only, no path separators).
+        let executor = ProcessExecutor::new();
+        if !executor.is_allowed(program) {
+            return Err(Error::PolicyViolation(format!(
+                "executable not in allowlist: {program}"
             )));
         }
+
+        // Environment security: deny-listed server-env vars are a hard error;
+        // the whitelisted subset becomes the child's environment.
+        let environment = executor.build_env()?;
+
+        // Resolve through PATH (bare names only; no absolute paths).
+        let exe = resolve_executable(program)?;
 
         let id = request.id;
 
         // Build the child process
-        let mut cmd = std::process::Command::new(&request.executable);
+        let mut cmd = std::process::Command::new(&exe);
         cmd.args(&request.arguments);
         cmd.current_dir(&request.working_directory);
-        cmd.envs(&request.environment);
+        cmd.envs(environment);
 
         // Platform-specific process setup
         #[cfg(windows)]

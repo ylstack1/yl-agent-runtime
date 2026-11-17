@@ -28,7 +28,7 @@ use runtime_core::audit::{AuditEvent, AuditEventType};
 use runtime_core::error::Error;
 use runtime_core::traits::{CapabilityGrant, ExecutionRequest, TerminationMode, WorkspaceService};
 use runtime_core::types::*;
-use runtime_process::ProcessServiceOps;
+use runtime_process::{ProcessExecutor, ProcessServiceOps};
 use runtime_workspace::WorkspaceServiceImpl;
 use runtime_workspace::files::edit::{EditOptions, EditSpec};
 use runtime_workspace::files::read::{ReadOptions, ReadOutcome};
@@ -283,12 +283,23 @@ impl McpServer {
         let args: ProcessExecArgs =
             serde_json::from_value(serde_json::Value::Object(args))
                 .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
-        let result = self
-            .runtime
-            .execute_command(args.command, args.args.unwrap_or_default())
-            .await
+        let executor = ProcessExecutor::new();
+        let result = executor
+            .execute(
+                &args.command,
+                &args.args.unwrap_or_default(),
+                None,
+                args.timeout_seconds.unwrap_or(300),
+            )
             .map_err(Self::map_runtime_error)?;
-        output_json(&result)
+        output_json(&json!({
+            "exit_code": result.exit_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "error_type": result.error_type,
+            "duration_ms": result.duration_ms,
+            "success": result.success,
+        }))
     }
 
     /// Spawn a process and return a handle.
@@ -321,25 +332,44 @@ impl McpServer {
             return Err(invalid("No workspace roots configured"));
         }
 
+        // Resolve the project: prefer an explicit project_id that matches a
+        // registered root, otherwise fall back to the first (primary) root so
+        // clients do not need to know the internally-assigned UUID.
         let project_id = Uuid::parse_str(&args.project_id)
-            .map_err(|e| invalid(format!("invalid project_id: {e}")))?;
-        let project_id = ProjectId(project_id);
-
+            .ok()
+            .and_then(|pid| {
+                self.roots
+                    .iter()
+                    .find(|(p, _)| *p == ProjectId(pid))
+                    .map(|(p, _)| *p)
+            })
+            .or_else(|| self.roots.first().map(|(p, _)| *p))
+            .ok_or_else(|| invalid("No workspace roots configured"))?;
         let root = self
             .roots
             .iter()
-            .find(|(pid, _)| *pid == project_id)
+            .find(|(p, _)| *p == project_id)
             .map(|(_, path)| path.clone())
-            .ok_or_else(|| {
-                invalid(format!(
-                    "project_id not found in roots: {}",
-                    args.project_id
-                ))
-            })?;
+            .ok_or_else(|| invalid("project root not found"))?;
 
         let cwd = match &args.cwd {
-            Some(c) => root.join(c),
-            None => root,
+            Some(c) => {
+                let joined = root.join(c);
+                let canonical_root = std::fs::canonicalize(&root)
+                    .map_err(|e| invalid(format!("cannot canonicalize root: {e}")))?;
+                let canonical_cwd = std::fs::canonicalize(&joined).map_err(|_| {
+                    invalid(format!(
+                        "cwd is not within allowed workspace root: {c}. Allowed roots: {root:?}"
+                    ))
+                })?;
+                if !canonical_cwd.starts_with(&canonical_root) {
+                    return Err(invalid(format!(
+                        "cwd is not within allowed workspace root: {c}. Allowed roots: {root:?}"
+                    )));
+                }
+                canonical_cwd
+            }
+            None => root.clone(),
         };
 
         let request = ExecutionRequest {
