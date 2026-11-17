@@ -12,6 +12,7 @@ members = [
     "crates/runtime-process",
     "crates/runtime-terminal",
     "crates/runtime-toolchain",
+    "crates/runtime-undo",
     "crates/runtime-audit",
     "crates/runtime-mcp",
     "crates/runtime-transport",

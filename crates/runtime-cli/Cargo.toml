@@ -27,6 +27,7 @@ runtime-identity = { path = "../runtime-identity" }
 runtime-daemon = { path = "../runtime-daemon" }
 runtime-policy = { path = "../runtime-policy" }
 runtime-approval = { path = "../runtime-approval" }
+runtime-undo = { path = "../runtime-undo" }
 runtime-process = { path = "../runtime-process" }
 runtime-workspace = { path = "../runtime-workspace" }
 runtime-mcp = { path = "../runtime-mcp" }

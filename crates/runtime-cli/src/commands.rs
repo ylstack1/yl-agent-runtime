@@ -12,6 +12,7 @@ use runtime_core::types::*;
 use runtime_process::{ProcessService, ProcessServiceOps};
 use runtime_policy::PolicyEngineImpl;
 use runtime_toolchain::ToolchainDiscovery;
+use runtime_undo::UndoJournal;
 use runtime_workspace::{SensitiveMatcher, WorkspaceService, WorkspaceServiceImpl};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -262,6 +263,9 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
         process_service,
         policy_engine,
         approval_broker,
+        Arc::new(runtime_undo::UndoJournal::new().with_log_path(
+            config.data_dir.join("undo.jsonl"),
+        )),
         opts.yolo || config.policy.yolo,
     ).await;
 
@@ -417,6 +421,9 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, yolo: 
         process_service,
         policy_engine,
         approval_broker,
+        Arc::new(runtime_undo::UndoJournal::new().with_log_path(
+            config.data_dir.join("undo.jsonl"),
+        )),
         config.policy.yolo,
     ).await);
 

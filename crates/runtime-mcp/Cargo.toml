@@ -27,6 +27,7 @@ runtime-terminal = { path = "../runtime-terminal" }
 runtime-toolchain = { path = "../runtime-toolchain" }
 runtime-identity = { path = "../runtime-identity" }
 runtime-approval = { path = "../runtime-approval" }
+runtime-undo = { path = "../runtime-undo" }
 runtime-audit = { path = "../runtime-audit" }
 runtime-config = { path = "../runtime-config" }
 base64 = { workspace = true }

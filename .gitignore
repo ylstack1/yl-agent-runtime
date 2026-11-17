@@ -11,6 +11,7 @@
 # Runtime artifacts (generated when the server runs)
 **/data/audit.jsonl
 **/data/approvals.jsonl
+**/data/undo.jsonl
 
 # IDE
 .idea/

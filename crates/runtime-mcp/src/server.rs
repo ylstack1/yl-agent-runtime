@@ -28,6 +28,7 @@ use runtime_approval::ApprovalBroker;
 use runtime_core::ApprovalState;
 use runtime_core::audit::{AuditEvent, AuditEventType};
 use runtime_core::error::Error;
+use runtime_undo::UndoJournal;
 use runtime_core::traits::{ExecutionRequest, PolicyEngine, TerminationMode, WorkspaceService};
 use runtime_core::types::*;
 use runtime_process::{ProcessExecutor, ProcessServiceOps};
@@ -45,6 +46,7 @@ use crate::tools_fs::{
     resolve_project, SearchArgs, StatArgs, TreeArgs, TreeBudgetExceeded, walk_shallow, walk_tree,
     WriteArgs,
 };
+use chrono::Utc;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -61,6 +63,7 @@ pub struct McpServer {
     process_service: Arc<dyn ProcessServiceOps>,
     policy_engine: Arc<dyn PolicyEngine>,
     approval_broker: Arc<dyn ApprovalBroker>,
+    undo_journal: Arc<runtime_undo::UndoJournal>,
     yolo: bool,                              // bypass Ask -> Allow, audited
     agent_id: AgentId,                       // derived from principal_agent
     principal_agent: String,                 // "mcp-local" (design decision 4)
@@ -96,6 +99,7 @@ impl McpServer {
         process_service: Arc<dyn ProcessServiceOps>,
         policy_engine: Arc<dyn PolicyEngine>,
         approval_broker: Arc<dyn ApprovalBroker>,
+        undo_journal: Arc<runtime_undo::UndoJournal>,
         yolo: bool,
     ) -> Self {
         // Derive a stable agent id from the principal agent name so policy
@@ -117,6 +121,7 @@ impl McpServer {
             process_service,
             policy_engine,
             approval_broker,
+            undo_journal,
             yolo,
             agent_id,
             principal_agent,
@@ -1148,6 +1153,17 @@ impl McpServer {
         self.enforce_tool(Capability::WorkspaceWrite, Some(&path.display().to_string()))
             .await?;
 
+        // Capture old content before writing (for undo).
+        let old_content = self
+            .fs
+            .read_text(project_id, &path, &ReadOptions::default())
+            .await
+            .ok()
+            .and_then(|outcome| match outcome {
+                runtime_workspace::files::read::ReadOutcome::Text(t) => Some(t.content),
+                _ => None,
+            });
+
         let opts = WriteOptions {
             overwrite: args.overwrite.unwrap_or(false),
             append: args.append.unwrap_or(false),
@@ -1164,6 +1180,21 @@ impl McpServer {
             Some(path.display().to_string()),
         )
         .await;
+
+        // Record undo entry.
+        let entry = runtime_undo::UndoJournalEntry {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            operation: runtime_undo::UndoOperation::Write,
+            path: path.clone(),
+            old_content,
+            new_content: Some(args.content),
+            old_path: None,
+            new_path: None,
+            commit_hash: None,
+        };
+        self.undo_journal.record(entry).await;
+
         output_json(&json!({ "bytes": outcome.bytes, "eol": outcome.eol, "diff": outcome.diff }))
     }
 
@@ -1902,6 +1933,230 @@ impl McpServer {
             .collect();
         output_json(&json!({ "pending": items, "count": items.len() }))
     }
+
+    /// Undo the most recent mutating operation.
+    #[tool(
+        name = "undo",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({ "type": "object", "properties": {}, "required": [] })
+            )
+            .expect("invalid undo input schema")
+        )
+    )]
+    async fn undo(&self, _args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let entry = self.undo_journal.undo().await;
+        let entry = match entry {
+            Some(e) => e,
+            None => return output_json(&json!({ "undone": false, "message": "nothing to undo" })),
+        };
+
+        let result = self.reverse_operation(&entry).await;
+        match result {
+            Ok(()) => output_json(&json!({
+                "undone": true,
+                "operation": entry.operation.as_str(),
+                "path": entry.path.display().to_string(),
+            })),
+            Err(e) => output_json(&json!({
+                "undone": false,
+                "operation": entry.operation.as_str(),
+                "path": entry.path.display().to_string(),
+                "error": e.to_string(),
+            })),
+        }
+    }
+
+    /// Redo the most recently undone operation.
+    #[tool(
+        name = "redo",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({ "type": "object", "properties": {}, "required": [] })
+            )
+            .expect("invalid redo input schema")
+        )
+    )]
+    async fn redo(&self, _args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let entry = self.undo_journal.redo().await;
+        let entry = match entry {
+            Some(e) => e,
+            None => return output_json(&json!({ "redone": false, "message": "nothing to redo" })),
+        };
+
+        let result = self.reapply_operation(&entry).await;
+        match result {
+            Ok(()) => output_json(&json!({
+                "redone": true,
+                "operation": entry.operation.as_str(),
+                "path": entry.path.display().to_string(),
+            })),
+            Err(e) => output_json(&json!({
+                "redone": false,
+                "operation": entry.operation.as_str(),
+                "path": entry.path.display().to_string(),
+                "error": e.to_string(),
+            })),
+        }
+    }
+
+    /// Reverse an undone operation.
+    async fn reverse_operation(&self, entry: &runtime_undo::UndoJournalEntry) -> Result<(), String> {
+        match entry.operation {
+            runtime_undo::UndoOperation::Write
+            | runtime_undo::UndoOperation::Edit
+            | runtime_undo::UndoOperation::Patch => {
+                // Restore old content. If old_content is None, the file was
+                // created by this operation, so undo means deleting it.
+                match &entry.old_content {
+                    Some(content) => {
+                        let project_id = self
+                            .roots
+                            .first()
+                            .map(|(id, _)| *id)
+                            .ok_or_else(|| "no workspace root".to_string())?;
+                        self.fs
+                            .write_text(project_id, &entry.path, content, &Default::default())
+                            .await
+                            .map_err(|e| format!("failed to restore content: {e}"))?;
+                    }
+                    None => {
+                        let project_id = self
+                            .roots
+                            .first()
+                            .map(|(id, _)| *id)
+                            .ok_or_else(|| "no workspace root".to_string())?;
+                        self.fs
+                            .delete_entries(project_id, &[entry.path.clone()], false)
+                            .await
+                            .map_err(|e| format!("failed to delete created file: {e}"))?;
+                    }
+                }
+            }
+            runtime_undo::UndoOperation::Delete => {
+                // Recreate the deleted file with old content.
+                match &entry.old_content {
+                    Some(content) => {
+                        let project_id = self
+                            .roots
+                            .first()
+                            .map(|(id, _)| *id)
+                            .ok_or_else(|| "no workspace root".to_string())?;
+                        self.fs
+                            .write_text(project_id, &entry.path, content, &Default::default())
+                            .await
+                            .map_err(|e| format!("failed to recreate file: {e}"))?;
+                    }
+                    None => return Err("no content to restore for delete".to_string()),
+                }
+            }
+            runtime_undo::UndoOperation::Mkdir => {
+                let project_id = self
+                    .roots
+                    .first()
+                    .map(|(id, _)| *id)
+                    .ok_or_else(|| "no workspace root".to_string())?;
+                self.fs
+                    .delete_entries(project_id, &[entry.path.clone()], true)
+                    .await
+                    .map_err(|e| format!("failed to remove directory: {e}"))?;
+            }
+            runtime_undo::UndoOperation::Move => {
+                // Move back from new_path to old_path.
+                let new_path = entry.new_path.as_ref().ok_or_else(|| {
+                    "move operation missing new_path".to_string()
+                })?;
+                let project_id = self
+                    .roots
+                    .first()
+                    .map(|(id, _)| *id)
+                    .ok_or_else(|| "no workspace root".to_string())?;
+                self.fs
+                    .move_entry_checked(project_id, new_path, &entry.path)
+                    .await
+                    .map_err(|e| format!("failed to reverse move: {e}"))?;
+            }
+            runtime_undo::UndoOperation::GitCommit => {
+                // Undo the commit: reset to HEAD~1
+                let project_id = self
+                    .roots
+                    .first()
+                    .map(|(id, _)| *id)
+                    .ok_or_else(|| "no workspace root".to_string())?;
+                let root = self.root_for_project(project_id).map_err(|e| e.to_string())?;
+                let executor = runtime_process::ProcessExecutor::new();
+                let _ = executor
+                    .execute("git", &["reset".to_string(), "--hard".to_string(), "HEAD~1".to_string()], Some(&root), 30)
+                    .map_err(|e| format!("git reset failed: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-apply an undone operation (redo).
+    async fn reapply_operation(&self, entry: &runtime_undo::UndoJournalEntry) -> Result<(), String> {
+        match entry.operation {
+            runtime_undo::UndoOperation::Write
+            | runtime_undo::UndoOperation::Edit
+            | runtime_undo::UndoOperation::Patch => {
+                match &entry.new_content {
+                    Some(content) => {
+                        let project_id = self
+                            .roots
+                            .first()
+                            .map(|(id, _)| *id)
+                            .ok_or_else(|| "no workspace root".to_string())?;
+                        self.fs
+                            .write_text(project_id, &entry.path, content, &Default::default())
+                            .await
+                            .map_err(|e| format!("failed to reapply content: {e}"))?;
+                    }
+                    None => return Err("no content to reapply".to_string()),
+                }
+            }
+            runtime_undo::UndoOperation::Delete => {
+                let project_id = self
+                    .roots
+                    .first()
+                    .map(|(id, _)| *id)
+                    .ok_or_else(|| "no workspace root".to_string())?;
+                self.fs
+                    .delete_entries(project_id, &[entry.path.clone()], false)
+                    .await
+                    .map_err(|e| format!("failed to re-delete: {e}"))?;
+            }
+            runtime_undo::UndoOperation::Mkdir => {
+                let project_id = self
+                    .roots
+                    .first()
+                    .map(|(id, _)| *id)
+                    .ok_or_else(|| "no workspace root".to_string())?;
+                self.fs
+                    .create_directory(project_id, entry.path.clone())
+                    .await
+                    .map_err(|e| format!("failed to recreate directory: {e}"))?;
+            }
+            runtime_undo::UndoOperation::Move => {
+                let old_path = entry.old_path.as_ref().ok_or_else(|| {
+                    "move operation missing old_path".to_string()
+                })?;
+                let project_id = self
+                    .roots
+                    .first()
+                    .map(|(id, _)| *id)
+                    .ok_or_else(|| "no workspace root".to_string())?;
+                self.fs
+                    .move_entry_checked(project_id, old_path, entry.new_path.as_ref().unwrap())
+                    .await
+                    .map_err(|e| format!("failed to reapply move: {e}"))?;
+            }
+            runtime_undo::UndoOperation::GitCommit => {
+                // Redoing a commit is complex; skip for now.
+                return Err("git commit redo not supported".to_string());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `#[tool_handler]` wires the router into `ServerHandler` and generates
@@ -1946,6 +2201,8 @@ mod tests {
             Arc::new(runtime_policy::PolicyEngineImpl::new());
         let approval_broker: Arc<dyn ApprovalBroker> =
             Arc::new(runtime_approval::ApprovalBrokerImpl::new());
+        let undo_journal: Arc<runtime_undo::UndoJournal> =
+            Arc::new(runtime_undo::UndoJournal::new());
         let server = McpServer::new_for_fs(
             fs,
             vec![(id, dir.path().to_path_buf())],
@@ -1954,6 +2211,7 @@ mod tests {
             process_service,
             policy_engine,
             approval_broker,
+            undo_journal,
             false,
         ).await;
         (server, dir, audit)
@@ -2161,6 +2419,8 @@ mod tests {
             Arc::new(runtime_policy::PolicyEngineImpl::new());
         let approval_broker: Arc<dyn ApprovalBroker> =
             Arc::new(runtime_approval::ApprovalBrokerImpl::new());
+        let undo_journal: Arc<runtime_undo::UndoJournal> =
+            Arc::new(runtime_undo::UndoJournal::new());
         let server = McpServer::new_for_fs(
             fs,
             vec![(id, dir.path().to_path_buf())],
@@ -2169,6 +2429,7 @@ mod tests {
             process_service,
             policy_engine,
             approval_broker,
+            undo_journal,
             false,
         ).await;
         let result = server
@@ -2317,6 +2578,8 @@ mod tests {
             Arc::new(runtime_policy::PolicyEngineImpl::new());
         let approval_broker: Arc<dyn ApprovalBroker> =
             Arc::new(runtime_approval::ApprovalBrokerImpl::new());
+        let undo_journal: Arc<runtime_undo::UndoJournal> =
+            Arc::new(runtime_undo::UndoJournal::new());
         let server = McpServer::new_for_fs(
             fs,
             vec![],
@@ -2325,6 +2588,7 @@ mod tests {
             process_service,
             policy_engine,
             approval_broker,
+            undo_journal,
             false,
         ).await;
         let err = server
