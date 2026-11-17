@@ -161,6 +161,10 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("process.stop", &["process_id", "force"]),
     ("process.list", &["project_id"]),
     ("process.discover_tools", &[]),
+    ("approval.request", &["capability", "resource", "justification"]),
+    ("approval.approve", &["approval_id"]),
+    ("approval.reject", &["approval_id", "reason"]),
+    ("approval.list", &[]),
 ];
 
 /// Base keys plus every alias canonical target (post-normalization names such

@@ -4,18 +4,20 @@ use anyhow::Result;
 use axum::Router;
 use axum::http::{HeaderName, Method};
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use runtime_approval::ApprovalBroker;
 use runtime_audit::{AuditService, AuditServiceImpl};
 use runtime_config::Config;
-use runtime_core::traits::ExecutionRequest;
+use runtime_core::traits::{ExecutionRequest, PolicyEngine};
 use runtime_core::types::*;
 use runtime_process::{ProcessService, ProcessServiceOps};
+use runtime_policy::PolicyEngineImpl;
 use runtime_toolchain::ToolchainDiscovery;
 use runtime_workspace::{SensitiveMatcher, WorkspaceService, WorkspaceServiceImpl};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 pub async fn start_daemon(config_path: &str) {
@@ -144,6 +146,7 @@ pub struct McpOptions {
     pub roots: Vec<String>,
     pub read_only_roots: Vec<String>,
     pub config: Option<String>,
+    pub yolo: bool,
 }
 
 /// Run the stdio MCP server with the workspace roots from CLI flags/config.
@@ -161,7 +164,7 @@ pub struct McpOptions {
 /// 7. Serve over stdio; return `Ok(())` on clean shutdown.
 pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
     // 1. Load config.
-    let config = match &opts.config {
+    let mut config = match &opts.config {
         Some(path) => Config::load_from_file(&PathBuf::from(path))?,
         None => {
             let default_path = PathBuf::from("./config/runtime.toml");
@@ -172,6 +175,12 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
             }
         }
     };
+    
+    // YL_YOLO=1 env var bypasses approval requests (audited).
+    if std::env::var("YL_YOLO").ok().as_deref() == Some("1") {
+        config.policy.yolo = true;
+        warn!("YOLO mode enabled via YL_YOLO=1: approval requests are bypassed (audited)");
+    }
 
     // 2. Merge roots: CLI `--root` replaces config roots when non-empty;
     //    read-only roots append (CLI read-only roots first, then config ones).
@@ -209,6 +218,11 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
     info!("Workspace roots: {:?}", roots);
     info!("Read-only roots: {:?}", read_only_roots);
 
+    // Build the policy engine before registering roots so profiles are known
+    // during enforcement.
+    let policy_engine: Arc<dyn runtime_policy::PolicyEngine> =
+        Arc::new(runtime_policy::PolicyEngineImpl::new());
+
     // 4. Build the workspace service and register roots.
     let service = Arc::new(WorkspaceServiceImpl::new());
     service.set_sensitive(SensitiveMatcher::new());
@@ -218,11 +232,14 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
             .register(root.clone(), ExecutionProfile::Development)
             .await?;
         roots_pairs.push((id, root));
+        // Set the profile in the policy store so enforcement knows the project's profile.
+        policy_engine.set_profile(id, ExecutionProfile::Development).await?;
     }
     let server_read_only_roots = read_only_roots.clone();
     for root in read_only_roots {
         let id = service.register(root.clone(), ExecutionProfile::Inspect).await?;
         roots_pairs.push((id, root));
+        policy_engine.set_profile(id, ExecutionProfile::Inspect).await?;
     }
 
     // 5. Build the audit service, creating the data directory if missing.
@@ -230,7 +247,11 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
     let audit: Arc<dyn AuditService> =
         Arc::new(AuditServiceImpl::new().with_log_path(config.data_dir.join("audit.jsonl")));
 
-    // 6. Build the MCP server (Task 11 `new_for_fs`).
+    // 6. Build the approval broker and MCP server.
+    let approval_broker: Arc<dyn runtime_approval::ApprovalBroker> =
+        Arc::new(runtime_approval::ApprovalBrokerImpl::new().with_log_path(
+            config.data_dir.join("approvals.jsonl"),
+        ));
     let process_service: Arc<dyn runtime_process::ProcessServiceOps> =
         Arc::new(runtime_process::ProcessService::new());
     let mcp_server = runtime_mcp::McpServer::new_for_fs(
@@ -239,7 +260,10 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
         audit,
         server_read_only_roots,
         process_service,
-    );
+        policy_engine,
+        approval_broker,
+        opts.yolo || config.policy.yolo,
+    ).await;
 
     // 7. Serve over stdio.
     use rmcp::ServiceExt;
@@ -284,7 +308,7 @@ fn local_lan_ip() -> Option<std::net::IpAddr> {
     sock.local_addr().ok().map(|a| a.ip())
 }
 
-pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots: Vec<String>) -> Result<()> {
+pub async fn run_http_server(host: String, port: u16, allow_remote: bool, yolo: bool, roots: Vec<String>) -> Result<()> {
     // 1. Load config.
     let config = match std::env::var("YL_RUNTIME_CONFIG").ok() {
         Some(path) if !path.is_empty() => Config::load_from_file(&PathBuf::from(path))?,
@@ -297,6 +321,25 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
             }
         }
     };
+
+    // Project-level override: .yl/policy.toml can override [tools.approval]
+    // settings from the global config. Project config wins.
+    let mut config = config;
+    if let Ok(project_policy) = Config::load_from_file(&PathBuf::from("./.yl/policy.toml")) {
+        config.policy = project_policy.policy;
+        info!("Loaded project-level policy overrides from .yl/policy.toml");
+    }
+
+    // CLI --yolo flag overrides config yolo setting.
+    if yolo {
+        config.policy.yolo = true;
+        warn!("YOLO mode enabled: approval requests are bypassed (audited)");
+    }
+    // YL_YOLO=1 env var also enables yolo mode.
+    if std::env::var("YL_YOLO").ok().as_deref() == Some("1") {
+        config.policy.yolo = true;
+        warn!("YOLO mode enabled via YL_YOLO=1: approval requests are bypassed (audited)");
+    }
 
     // 2. Merge roots: CLI `--root` replaces config roots when non-empty;
     //    read-only roots append. Every root is canonicalized and must exist.
@@ -330,6 +373,11 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
     info!("Workspace roots: {:?}", roots);
     info!("Read-only roots: {:?}", read_only_roots);
 
+    // Build the policy engine before registering roots so profiles are known
+    // during enforcement.
+    let policy_engine: Arc<dyn runtime_policy::PolicyEngine> =
+        Arc::new(runtime_policy::PolicyEngineImpl::new());
+
     // 4. Build the workspace service and register roots.
     let service = Arc::new(WorkspaceServiceImpl::new());
     service.set_sensitive(SensitiveMatcher::new());
@@ -339,11 +387,14 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
             .register(root.clone(), ExecutionProfile::Development)
             .await?;
         roots_pairs.push((id, root));
+        // Set the profile in the policy store so enforcement knows the project's profile.
+        policy_engine.set_profile(id, ExecutionProfile::Development).await?;
     }
     let server_read_only_roots = read_only_roots.clone();
     for root in read_only_roots {
         let id = service.register(root.clone(), ExecutionProfile::Inspect).await?;
         roots_pairs.push((id, root));
+        policy_engine.set_profile(id, ExecutionProfile::Inspect).await?;
     }
 
     // 5. Build the audit service, creating the data directory if missing.
@@ -351,7 +402,11 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
     let audit: Arc<dyn AuditService> =
         Arc::new(AuditServiceImpl::new().with_log_path(config.data_dir.join("audit.jsonl")));
 
-    // 6. Build the MCP server (Task 11 `new_for_fs`).
+    // 6. Build the approval broker and MCP server.
+    let approval_broker: Arc<dyn runtime_approval::ApprovalBroker> =
+        Arc::new(runtime_approval::ApprovalBrokerImpl::new().with_log_path(
+            config.data_dir.join("approvals.jsonl"),
+        ));
     let process_service: Arc<dyn runtime_process::ProcessServiceOps> =
         Arc::new(runtime_process::ProcessService::new());
     let mcp_server = Arc::new(runtime_mcp::McpServer::new_for_fs(
@@ -360,7 +415,10 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
         audit,
         server_read_only_roots,
         process_service,
-    ));
+        policy_engine,
+        approval_broker,
+        config.policy.yolo,
+    ).await);
 
     // 7. Serve over Streamable HTTP.
     use rmcp::transport::streamable_http_server::{
@@ -475,4 +533,73 @@ async fn port_is_open(port: u16) -> bool {
     tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .is_ok()
+}
+
+/// Run the `yl approval` subcommand against a locally running server.
+///
+/// Connects to the MCP server on 127.0.0.1:8077 and calls the corresponding
+/// approval tool. Falls back to direct file-based inspection if the server
+/// is not reachable (best-effort for offline use).
+pub async fn run_approval(action: ApprovalAction) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))?;
+    let url = "http://127.0.0.1:8077/mcp";
+
+    fn rpc(id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        })
+    }
+
+    match action {
+        ApprovalAction::Approve { approval_id } => {
+            let body = rpc(1, "tools/call", serde_json::json!({
+                "name": "approval.approve",
+                "arguments": { "approval_id": approval_id }
+            }));
+            let resp = client.post(url).json(&body).send().await?;
+            let text = resp.text().await?;
+            println!("{text}");
+        }
+        ApprovalAction::Reject { approval_id, reason } => {
+            let body = rpc(2, "tools/call", serde_json::json!({
+                "name": "approval.reject",
+                "arguments": { "approval_id": approval_id, "reason": reason.unwrap_or_default() }
+            }));
+            let resp = client.post(url).json(&body).send().await?;
+            let text = resp.text().await?;
+            println!("{text}");
+        }
+        ApprovalAction::List => {
+            let body = rpc(3, "tools/call", serde_json::json!({
+                "name": "approval.list",
+                "arguments": {}
+            }));
+            let resp = client.post(url).json(&body).send().await?;
+            let text = resp.text().await?;
+            println!("{text}");
+        }
+    }
+    Ok(())
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ApprovalAction {
+    /// Approve a pending approval by id
+    Approve {
+        approval_id: String,
+    },
+    /// Reject a pending approval by id, with an optional reason
+    Reject {
+        approval_id: String,
+        #[arg(long, short)]
+        reason: Option<String>,
+    },
+    /// List pending (not-yet-decided) approvals
+    List,
 }

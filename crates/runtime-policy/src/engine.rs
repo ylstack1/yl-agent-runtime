@@ -73,6 +73,11 @@ impl PolicyEngine for PolicyEngineImpl {
         let store = self.store.read().await;
         store.get_capabilities(agent_id, project_id).await
     }
+
+    async fn set_profile(&self, project_id: ProjectId, profile: ExecutionProfile) -> Result<()> {
+        self.store.write().await.set_profile(project_id, profile).await;
+        Ok(())
+    }
 }
 
 /// Policy store - holds grants and profiles

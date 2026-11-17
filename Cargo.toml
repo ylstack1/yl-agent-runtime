@@ -76,6 +76,9 @@ iroh = "1.4"
 axum = "0.8"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
+# HTTP client (for CLI approval commands talking to the running server)
+reqwest = { version = "0.12", features = ["json"] }
+
 # IPC
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 bytes = "1.5"

@@ -89,7 +89,7 @@ async fn spawn_mcp(
 ) -> Result<StdioSession, Box<dyn Error + Send + Sync>> {
     let tmp = tempfile::TempDir::new().unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_yl"));
-    cmd.arg("mcp").arg("--root").arg(tmp.path());
+    cmd.arg("mcp").arg("--root").arg(tmp.path()).arg("--yolo");
     for arg in extra_args {
         cmd.arg(arg);
     }

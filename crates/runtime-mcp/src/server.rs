@@ -24,9 +24,11 @@ use rmcp::{
 };
 use rmcp::ErrorData as McpError;
 use runtime_audit::AuditService;
+use runtime_approval::ApprovalBroker;
+use runtime_core::ApprovalState;
 use runtime_core::audit::{AuditEvent, AuditEventType};
 use runtime_core::error::Error;
-use runtime_core::traits::{ExecutionRequest, TerminationMode, WorkspaceService};
+use runtime_core::traits::{ExecutionRequest, PolicyEngine, TerminationMode, WorkspaceService};
 use runtime_core::types::*;
 use runtime_process::{ProcessExecutor, ProcessServiceOps};
 use runtime_workspace::WorkspaceServiceImpl;
@@ -56,8 +58,12 @@ pub struct McpServer {
     read_only_roots: Vec<PathBuf>,
     audit: Arc<dyn runtime_audit::AuditService>,
     process_service: Arc<dyn ProcessServiceOps>,
-    principal_agent: String,                // "mcp-local" (design decision 4)
-    session_id: SessionId,                  // per-process synthetic session
+    policy_engine: Arc<dyn PolicyEngine>,
+    approval_broker: Arc<dyn ApprovalBroker>,
+    yolo: bool,                              // bypass Ask -> Allow, audited
+    agent_id: AgentId,                       // derived from principal_agent
+    principal_agent: String,                 // "mcp-local" (design decision 4)
+    session_id: SessionId,                   // per-process synthetic session
 }
 
 /// Runtime status shape returned by `runtime.status`.
@@ -81,20 +87,38 @@ pub struct CommandResult {
 }
 
 impl McpServer {
-    pub fn new_for_fs(
+    pub async fn new_for_fs(
         fs: Arc<WorkspaceServiceImpl>,
         roots: Vec<(ProjectId, PathBuf)>,
         audit: Arc<dyn AuditService>,
         read_only_roots: Vec<PathBuf>,
         process_service: Arc<dyn ProcessServiceOps>,
+        policy_engine: Arc<dyn PolicyEngine>,
+        approval_broker: Arc<dyn ApprovalBroker>,
+        yolo: bool,
     ) -> Self {
+        // Derive a stable agent id from the principal agent name so policy
+        // grants persist across restarts for the same logical agent.
+        let principal_agent = "mcp-local".to_string();
+        let agent_id = agent_id_from_name(&principal_agent);
+
+        // Register each root's profile in the policy store so enforcement
+        // knows which profile applies to each project.
+        for (id, _) in &roots {
+            let _ = policy_engine.set_profile(*id, ExecutionProfile::Development).await;
+        }
+
         Self {
             fs,
             roots,
             read_only_roots,
             audit,
             process_service,
-            principal_agent: "mcp-local".to_string(),
+            policy_engine,
+            approval_broker,
+            yolo,
+            agent_id,
+            principal_agent,
             session_id: SessionId::new(),
         }
     }
@@ -136,6 +160,108 @@ impl McpServer {
             | Error::PolicyViolation(msg) => invalid(msg),
             Error::Io(e) => invalid(format!("IO error: {e}")),
             other => McpError::internal_error(other.to_string(), None),
+        }
+    }
+}
+
+/// Derive a stable AgentId from a principal-agent name so policy grants
+/// and approvals are tied to the same logical agent across restarts.
+fn agent_id_from_name(name: &str) -> AgentId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    AgentId(Uuid::from_u128(hasher.finish() as u128))
+}
+
+impl McpServer {
+    /// Enforce policy before a tool runs. Returns `Ok(())` when the call is
+    /// allowed. On `Deny`, returns an `invalid_params` error. On `Ask`,
+    /// creates a pending approval via the broker and returns an error that
+    /// includes the `approval_id` so the caller can approve and retry.
+    ///
+    /// When `yolo` is set, `Ask` is treated as `Allow` (bypass) and the call
+    /// proceeds, audited with `yolo: true`.
+    async fn enforce_tool(
+        &self,
+        capability: Capability,
+        resource: Option<&str>,
+    ) -> Result<(), McpError> {
+        if self.yolo {
+            let mut event = AuditEvent::new(AuditEventType::ApprovalRequested);
+            event = event.with_agent(self.agent_id);
+            if let Some(pid) = self.roots.first().map(|(id, _)| *id) {
+                event = event.with_project(pid);
+            }
+            event = event.with_session(self.session_id);
+            event = event.with_capability(capability);
+            if let Some(r) = resource {
+                event = event.with_resource(r.to_string());
+            }
+            event.metadata.insert("yolo".to_string(), "true".to_string());
+            if let Err(e) = self.audit.record(event).await {
+                tracing::warn!("failed to record yolo audit event: {e}");
+            }
+            return Ok(());
+        }
+
+        let project_id = self
+            .roots
+            .first()
+            .map(|(id, _)| *id)
+            .ok_or_else(|| invalid("no workspace root configured for policy evaluation"))?;
+
+        let decision = self
+            .policy_engine
+            .evaluate(self.agent_id, project_id, capability, resource)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        match decision {
+            PolicyDecision::Allow => Ok(()),
+            PolicyDecision::Deny => Err(invalid(format!(
+                "policy denied: {capability}{}",
+                resource.map(|r| format!(" (resource: {r})")).unwrap_or_default()
+            ))),
+            PolicyDecision::Ask => {
+                // Before creating a new pending approval, check if the caller
+                // already has a granted (non-expired) approval for this
+                // capability+resource. If so, allow the call without
+                // requiring re-approval.
+                let already_granted = self
+                    .approval_broker
+                    .list_all()
+                    .await
+                    .into_iter()
+                    .any(|r| {
+                        r.capability == capability
+                            && r.resource == resource.map(|s| s.to_string())
+                            && r.state == ApprovalState::Granted
+                            && r.expires_at
+                                .map(|e| chrono::Utc::now() <= e)
+                                .unwrap_or(true)
+                    });
+                if already_granted {
+                    return Ok(());
+                }
+
+                let justification = format!("MCP tool call requires approval for {capability}");
+                let approval_id = self
+                    .approval_broker
+                    .request(
+                        self.agent_id,
+                        project_id,
+                        capability,
+                        resource.map(|s| s.to_string()),
+                        justification,
+                    )
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                Err(invalid(format!(
+                    "approval required: {capability}{}. Approve with: yl approval approve {approval_id} (or MCP approval.approve). Expires in 30 minutes.",
+                    resource.map(|r| format!(" (resource: {r})")).unwrap_or_default()
+                )))
+            }
         }
     }
 
@@ -242,7 +368,7 @@ impl McpServer {
             },
             "runtime": {
                 "git_tools": false,
-                "approval_gate": false,
+                "approval_gate": true,
                 "undo_journal": false,
             },
             "limits": {
@@ -276,6 +402,11 @@ impl McpServer {
         let args: ProcessExecArgs =
             serde_json::from_value(serde_json::Value::Object(args))
                 .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+
+        // Approval gate: process execution requires consent in most profiles.
+        self.enforce_tool(Capability::ProcessExec, Some(&args.command))
+            .await?;
+
         let executor = ProcessExecutor::new();
         let result = executor
             .execute(
@@ -320,6 +451,10 @@ impl McpServer {
         let args: ProcessStartArgs =
             serde_json::from_value(serde_json::Value::Object(args))
                 .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+
+        // Approval gate: spawning a process requires consent in most profiles.
+        self.enforce_tool(Capability::ProcessStart, Some(&args.program))
+            .await?;
 
         if self.roots.is_empty() {
             return Err(invalid("No workspace roots configured"));
@@ -470,6 +605,10 @@ impl McpServer {
         let args: ProcessStopArgs =
             serde_json::from_value(serde_json::Value::Object(args))
                 .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+
+        // Approval gate: terminating a process requires consent.
+        self.enforce_tool(Capability::ProcessTerminate, Some(&args.process_id))
+            .await?;
 
         let process_id = Uuid::parse_str(&args.process_id)
             .map_err(|e| invalid(format!("invalid process_id: {e}")))?;
@@ -701,6 +840,11 @@ impl McpServer {
             serde_json::from_value(serde_json::Value::Object(args))
                 .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
         let (project_id, path) = self.resolve_user_path(&PathBuf::from(&args.path))?;
+
+        // Approval gate: file writes require consent in restrictive profiles.
+        self.enforce_tool(Capability::WorkspaceWrite, Some(&path.display().to_string()))
+            .await?;
+
         let opts = WriteOptions {
             overwrite: args.overwrite.unwrap_or(false),
             append: args.append.unwrap_or(false),
@@ -747,6 +891,11 @@ impl McpServer {
             serde_json::from_value(serde_json::Value::Object(args))
                 .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
         let (project_id, path) = self.resolve_user_path(&PathBuf::from(&args.path))?;
+
+        // Approval gate: file edits require consent in restrictive profiles.
+        self.enforce_tool(Capability::WorkspaceWrite, Some(&path.display().to_string()))
+            .await?;
+
         let dry_run = args.dry_run.unwrap_or(false);
         let edits: Vec<EditSpec> = args
             .into_specs()
@@ -803,6 +952,10 @@ impl McpServer {
         let args: PatchArgs =
             serde_json::from_value(serde_json::Value::Object(args))
                 .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+
+        // Approval gate: applying patches requires consent in restrictive profiles.
+        self.enforce_tool(Capability::WorkspaceWrite, None).await?;
+
         // The patch engine validates each patched path against the root itself;
         // the project id is only needed to locate the root.
         let (project_id, _) = self.resolve_user_path(&PathBuf::new())?;
@@ -858,6 +1011,11 @@ impl McpServer {
             }
         };
         let (project_id, path) = self.resolve_user_path(&PathBuf::from(&path))?;
+
+        // Approval gate: file writes require consent in restrictive profiles.
+        self.enforce_tool(Capability::WorkspaceWrite, Some(&path.display().to_string()))
+            .await?;
+
         let outcome = self
             .fs
             .replace_text(
@@ -1137,6 +1295,11 @@ impl McpServer {
             serde_json::from_value(serde_json::Value::Object(args))
                 .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
         let (project_id, path) = self.resolve_user_path(&PathBuf::from(&args.path))?;
+
+        // Approval gate: directory creation requires consent in restrictive profiles.
+        self.enforce_tool(Capability::WorkspaceWrite, Some(&path.display().to_string()))
+            .await?;
+
         self.fs
             .create_directory(project_id, path)
             .await
@@ -1175,6 +1338,11 @@ impl McpServer {
         let (project_id, source) = self.resolve_user_path(&PathBuf::from(&args.source))?;
         let (_project_id, destination) = self.resolve_user_path(&PathBuf::from(&args.destination))?;
         let _ = _project_id;
+
+        // Approval gate: moving files requires consent in restrictive profiles.
+        self.enforce_tool(Capability::WorkspaceWrite, Some(&source.display().to_string()))
+            .await?;
+
         let dest = self
             .fs
             .move_entry_checked(project_id, &source, &destination)
@@ -1218,12 +1386,19 @@ impl McpServer {
             .map(PathBuf::from)
             .collect();
         let first = paths.first().cloned();
-        let (project_id, _) = match first {
-            Some(path) => self.resolve_user_path(&path)?,
+        let (project_id, _) = match &first {
+            Some(path) => self.resolve_user_path(path)?,
             None => {
                 return Err(invalid("workspace.delete requires at least one path"))
             }
         };
+
+        // Approval gate: deleting files requires consent in restrictive profiles.
+        if let Some(path) = &first {
+            self.enforce_tool(Capability::WorkspaceWrite, Some(&path.display().to_string()))
+                .await?;
+        }
+
         let deleted = self
             .fs
             .delete_entries(project_id, &paths, args.recursive.unwrap_or(false))
@@ -1270,6 +1445,160 @@ impl McpServer {
                 .collect::<Vec<_>>(),
         }))
     }
+
+    /// Request approval for a capability+resource. Returns an `approval_id`
+    /// that can be used with `approval.approve` or `yl approval approve`.
+    #[tool(
+        name = "approval.request",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "capability": { "type": "string" },
+                        "resource": { "type": "string" },
+                        "justification": { "type": "string" }
+                    },
+                    "required": ["capability"]
+                })
+            )
+            .expect("invalid approval.request input schema")
+        )
+    )]
+    async fn approval_request(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("approval.request", &args.0)?;
+        let capability_str: String = args
+            .get("capability")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| invalid("approval.request requires a `capability` argument"))?;
+        let capability = Capability::from_str(&capability_str)
+            .map_err(|e| invalid(format!("unknown capability: {e}")))?;
+        let resource = args.get("resource").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let justification = args
+            .get("justification")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("Approval requested for {capability}"));
+
+        let project_id = self
+            .roots
+            .first()
+            .map(|(id, _)| *id)
+            .ok_or_else(|| invalid("no workspace root configured"))?;
+
+        let approval_id = self
+            .approval_broker
+            .request(self.agent_id, project_id, capability, resource, justification)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        output_json(&json!({
+            "approval_id": approval_id.to_string(),
+            "state": "pending",
+            "expires_in_seconds": 1800,
+        }))
+    }
+
+    /// Approve a pending approval by id, allowing the blocked tool call to proceed on retry.
+    #[tool(
+        name = "approval.approve",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "approval_id": { "type": "string" }
+                    },
+                    "required": ["approval_id"]
+                })
+            )
+            .expect("invalid approval.approve input schema")
+        )
+    )]
+    async fn approval_approve(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("approval.approve", &args.0)?;
+        let approval_id_str: String = args
+            .get("approval_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| invalid("approval.approve requires an `approval_id` argument"))?;
+        let approval_id = ApprovalId(Uuid::parse_str(&approval_id_str)
+            .map_err(|e| invalid(format!("invalid approval_id: {e}")))?);
+
+        self.approval_broker.approve(approval_id)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        output_json(&json!({ "approved": true, "approval_id": approval_id_str }))
+    }
+
+    /// Reject a pending approval by id, with an optional reason.
+    #[tool(
+        name = "approval.reject",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "approval_id": { "type": "string" },
+                        "reason": { "type": "string" }
+                    },
+                    "required": ["approval_id"]
+                })
+            )
+            .expect("invalid approval.reject input schema")
+        )
+    )]
+    async fn approval_reject(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("approval.reject", &args.0)?;
+        let approval_id_str: String = args
+            .get("approval_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| invalid("approval.reject requires an `approval_id` argument"))?;
+        let reason = args
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "rejected".to_string());
+        let approval_id = ApprovalId(Uuid::parse_str(&approval_id_str)
+            .map_err(|e| invalid(format!("invalid approval_id: {e}")))?);
+
+        self.approval_broker.reject(approval_id, reason.clone())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        output_json(&json!({ "rejected": true, "approval_id": approval_id_str, "reason": reason }))
+    }
+
+    /// List pending (not-yet-decided) approvals.
+    #[tool(
+        name = "approval.list",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({ "type": "object", "properties": {}, "required": [] })
+            )
+            .expect("invalid approval.list input schema")
+        )
+    )]
+    async fn approval_list(&self, _args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let pending = self.approval_broker.list_pending().await;
+        let items: Vec<serde_json::Value> = pending
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "approval_id": r.id.to_string(),
+                    "capability": r.capability.as_str(),
+                    "resource": r.resource,
+                    "justification": r.justification,
+                    "requested_at": r.created_at.to_rfc3339(),
+                    "expires_at": r.expires_at.map(|t| t.to_rfc3339()),
+                })
+            })
+            .collect();
+        output_json(&json!({ "pending": items, "count": items.len() }))
+    }
 }
 
 /// `#[tool_handler]` wires the router into `ServerHandler` and generates
@@ -1310,13 +1639,20 @@ mod tests {
         let audit = Arc::new(AuditServiceImpl::new());
         let process_service: Arc<dyn ProcessServiceOps> =
             Arc::new(runtime_process::ProcessService::new());
+        let policy_engine: Arc<dyn PolicyEngine> =
+            Arc::new(runtime_policy::PolicyEngineImpl::new());
+        let approval_broker: Arc<dyn ApprovalBroker> =
+            Arc::new(runtime_approval::ApprovalBrokerImpl::new());
         let server = McpServer::new_for_fs(
             fs,
             vec![(id, dir.path().to_path_buf())],
             audit.clone(),
             vec![],
             process_service,
-        );
+            policy_engine,
+            approval_broker,
+            false,
+        ).await;
         (server, dir, audit)
     }
 
@@ -1518,13 +1854,20 @@ mod tests {
         let audit = Arc::new(AuditServiceImpl::new());
         let process_service: Arc<dyn ProcessServiceOps> =
             Arc::new(runtime_process::ProcessService::new());
+        let policy_engine: Arc<dyn PolicyEngine> =
+            Arc::new(runtime_policy::PolicyEngineImpl::new());
+        let approval_broker: Arc<dyn ApprovalBroker> =
+            Arc::new(runtime_approval::ApprovalBrokerImpl::new());
         let server = McpServer::new_for_fs(
             fs,
             vec![(id, dir.path().to_path_buf())],
             audit,
             vec![dir.path().to_path_buf()],
             process_service,
-        );
+            policy_engine,
+            approval_broker,
+            false,
+        ).await;
         let result = server
             .workspace_allowed_roots(Parameters(obj(json!({}))))
             .await
@@ -1667,7 +2010,20 @@ mod tests {
         let audit = Arc::new(AuditServiceImpl::new());
         let process_service: Arc<dyn ProcessServiceOps> =
             Arc::new(runtime_process::ProcessService::new());
-        let server = McpServer::new_for_fs(fs, vec![], audit, vec![], process_service);
+        let policy_engine: Arc<dyn PolicyEngine> =
+            Arc::new(runtime_policy::PolicyEngineImpl::new());
+        let approval_broker: Arc<dyn ApprovalBroker> =
+            Arc::new(runtime_approval::ApprovalBrokerImpl::new());
+        let server = McpServer::new_for_fs(
+            fs,
+            vec![],
+            audit,
+            vec![],
+            process_service,
+            policy_engine,
+            approval_broker,
+            false,
+        ).await;
         let err = server
             .workspace_read(Parameters(obj(json!({"path": "a.txt"}))))
             .await

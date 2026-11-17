@@ -25,6 +25,8 @@ runtime-core = { path = "../runtime-core" }
 runtime-config = { path = "../runtime-config" }
 runtime-identity = { path = "../runtime-identity" }
 runtime-daemon = { path = "../runtime-daemon" }
+runtime-policy = { path = "../runtime-policy" }
+runtime-approval = { path = "../runtime-approval" }
 runtime-process = { path = "../runtime-process" }
 runtime-workspace = { path = "../runtime-workspace" }
 runtime-mcp = { path = "../runtime-mcp" }
@@ -32,6 +34,7 @@ runtime-audit = { path = "../runtime-audit" }
 runtime-toolchain = { path = "../runtime-toolchain" }
 axum = { workspace = true }
 tower-http = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

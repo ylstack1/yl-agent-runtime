@@ -40,6 +40,17 @@ pub struct PolicyConfig {
     pub policy_dir: PathBuf,
     pub fail_closed: bool,
     pub require_approval_for: Vec<Capability>,
+    /// How long (seconds) a pending approval lives before auto-deny.
+    #[serde(default = "default_approval_ttl_seconds")]
+    pub approval_ttl_seconds: u64,
+    /// When true, treat `Ask` policy decisions as `Allow` (bypass approval).
+    /// Audited prominently. Intended for automation/CI only.
+    #[serde(default)]
+    pub yolo: bool,
+}
+
+fn default_approval_ttl_seconds() -> u64 {
+    1800 // 30 minutes
 }
 
 /// Audit configuration
@@ -134,6 +145,8 @@ impl Config {
                     Capability::GitCommit,
                     Capability::SystemElevate,
                 ],
+                approval_ttl_seconds: 1800,
+                yolo: false,
             },
             audit: AuditConfig {
                 enabled: true,

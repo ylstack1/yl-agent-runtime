@@ -121,6 +121,8 @@ pub trait PolicyEngine: Send + Sync {
     async fn evaluate(&self, agent_id: AgentId, project_id: ProjectId, capability: Capability, resource: Option<&str>) -> Result<PolicyDecision>;
     async fn get_profile(&self, project_id: ProjectId) -> Result<ExecutionProfile>;
     async fn get_capabilities(&self, agent_id: AgentId, project_id: ProjectId) -> Result<Vec<CapabilityGrant>>;
+    /// Set the execution profile for a project (called when a workspace root is registered).
+    async fn set_profile(&self, project_id: ProjectId, profile: ExecutionProfile) -> Result<()>;
 }
 
 /// ApprovalBroker trait

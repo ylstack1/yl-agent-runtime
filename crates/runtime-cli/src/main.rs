@@ -46,6 +46,8 @@ enum Commands {
         read_only_roots: Vec<String>,
         #[arg(long)]
         config: Option<String>,
+        #[arg(long)]
+        yolo: bool,
     },
     /// Execute a command in a workspace
     Exec {
@@ -68,12 +70,21 @@ enum Commands {
         port: u16,
         #[arg(long)]
         allow_remote: bool,
+        #[arg(long)]
+        yolo: bool,
         #[arg(long = "root")]
         roots: Vec<String>,
+    },
+    /// Manage approval requests (approve/reject/list pending approvals)
+    Approval {
+        #[command(subcommand)]
+        action: ApprovalAction,
     },
 }
 
 mod commands;
+
+use commands::ApprovalAction;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -111,11 +122,13 @@ async fn main() -> anyhow::Result<()> {
             roots,
             read_only_roots,
             config,
+            yolo,
         } => {
             commands::run_mcp_server(commands::McpOptions {
                 roots,
                 read_only_roots,
                 config,
+                yolo,
             })
             .await?;
         }
@@ -132,9 +145,13 @@ async fn main() -> anyhow::Result<()> {
             host,
             port,
             allow_remote,
+            yolo,
             roots,
         } => {
-            commands::run_http_server(host, port, allow_remote, roots).await?;
+            commands::run_http_server(host, port, allow_remote, yolo, roots).await?;
+        }
+        Commands::Approval { action } => {
+            commands::run_approval(action).await?;
         }
     }
     Ok(())
