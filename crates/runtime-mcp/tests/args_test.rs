@@ -56,6 +56,17 @@ fn unknown_key_lists_valid() {
 }
 
 #[test]
+fn process_exec_known_keys_are_accepted() {
+    let result = normalize_args(
+        "process.exec",
+        &obj(json!({"project_id": "p", "command": "echo", "args": ["-n"], "timeout_seconds": 30})),
+    )
+    .unwrap();
+    assert_eq!(result.get("project_id"), Some(&json!("p")));
+    assert_eq!(result.get("command"), Some(&json!("echo")));
+}
+
+#[test]
 fn missing_required_lists_fields() {
     let msg = err_text(normalize_args("workspace.write", &obj(json!({"path": "x.txt"}))));
     assert!(msg.contains("Missing required argument(s): content"), "unexpected message: {msg}");

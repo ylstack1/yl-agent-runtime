@@ -95,6 +95,7 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("workspace.move", &["source", "destination"]),
     ("workspace.delete", &["paths", "recursive"]),
     ("workspace.allowed_roots", &[]),
+    ("process.exec", &["project_id", "command", "args", "timeout_seconds"]),
 ];
 
 /// Base keys plus every alias canonical target (post-normalization names such

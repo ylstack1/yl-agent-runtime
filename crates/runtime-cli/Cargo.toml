@@ -34,3 +34,5 @@ runtime-backend-api = { path = "../runtime-backend-api" }
 [dev-dependencies]
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+tokio = { workspace = true }

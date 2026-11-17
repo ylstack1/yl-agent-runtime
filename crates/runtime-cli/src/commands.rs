@@ -6,7 +6,7 @@ use runtime_config::Config;
 use runtime_core::types::*;
 use runtime_toolchain::ToolchainDiscovery;
 use runtime_workspace::{SensitiveMatcher, WorkspaceService, WorkspaceServiceImpl};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 
@@ -130,9 +130,13 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
     read_only_roots.extend(config.workspace.read_only_roots.clone());
 
     // Canonicalize + existence-check every root.
+    // On Windows `std::fs::canonicalize` returns `\\?\` verbatim-prefixed
+    // paths, which the path-safety layer rejects as UNC; strip it so roots
+    // are stored as ordinary absolute paths.
     let check_root = |p: &PathBuf| -> Result<PathBuf> {
-        std::fs::canonicalize(p)
-            .map_err(|_| anyhow::anyhow!("Workspace root does not exist: {}", p.display()))
+        let canonical = std::fs::canonicalize(p)
+            .map_err(|_| anyhow::anyhow!("Workspace root does not exist: {}", p.display()))?;
+        Ok(strip_verbatim_prefix(&canonical))
     };
     let roots: Vec<PathBuf> = roots.iter().map(check_root).collect::<Result<_>>()?;
     let read_only_roots: Vec<PathBuf> =
@@ -177,4 +181,16 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
     let server = mcp_server.serve(rmcp::transport::stdio()).await?;
     server.waiting().await?;
     Ok(())
+}
+
+/// Strip the Windows verbatim `\\?\` prefix from a canonicalized path so it
+/// is stored as an ordinary absolute path (path-safety rejects `\\` heads as
+/// UNC). No-op on non-Windows and on paths without the prefix.
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s.starts_with(r"\\?\") {
+        PathBuf::from(&s[4..])
+    } else {
+        path.to_path_buf()
+    }
 }

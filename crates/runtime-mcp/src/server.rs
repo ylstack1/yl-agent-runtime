@@ -523,7 +523,8 @@ impl McpServer {
             .apply_patch(project_id, &args.diff, args.dry_run.unwrap_or(false))
             .await
             .map_err(Self::map_runtime_error)?;
-        self.record_audit(AuditEventType::WorkspaceWrite, None, None).await;
+        self.record_audit(AuditEventType::WorkspaceWrite, Some(project_id), None)
+            .await;
         let values: Vec<serde_json::Value> = results
             .into_iter()
             .map(|result| {
@@ -993,7 +994,7 @@ impl McpServer {
 #[tool_handler(
     name = "yl-agent-runtime",
     version = "0.1.0",
-    instructions = "YL Agent Runtime - Portable agent execution runtime"
+    instructions = "YL Agent Runtime - Portable agent execution runtime. Use workspace.read (and the other workspace.* tools) against files under the directories passed with --root; the server refuses any path outside the configured roots and blocks sensitive files such as .env."
 )]
 impl ServerHandler for McpServer {
     // Intentionally empty: `#[tool_handler]` generates the required
