@@ -19,6 +19,17 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// The one place that explains a rejected executable. Both the executor and the
+/// process service use it so the message cannot drift between entry points.
+pub fn allowlist_error(program: &str, allowlist: &[String]) -> String {
+    format!(
+        "executable not in allowlist: {program}. Allowed: {}. \
+         Shell builtins (echo, cd, dir, type, set, pwd) are not executables; pass a real \
+         program instead, or call `process.discover_tools` to see which toolchains are installed here.",
+        allowlist.join(", ")
+    )
+}
+
 /// Executables that may be executed directly (name only, no path separators).
 pub const ALLOWED_TOOLS: &[&str] = &[
     "cargo", "rustc", "rustup", "git", "node", "bun", "python", "python3", "py",
@@ -101,8 +112,9 @@ impl ProcessExecutor {
 
         // 1. Executable allowlist (name only).
         if !self.allowlist.iter().any(|a| a.eq_ignore_ascii_case(program)) {
-            return Err(Error::PolicyViolation(format!(
-                "executable not in allowlist: {program}"
+            return Err(Error::PolicyViolation(allowlist_error(
+                program,
+                &self.allowlist,
             )));
         }
 
@@ -616,8 +628,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_executable_rejects_path_separators() {
-        assert!(resolve_executable("../foo").is_err());
+    fn allowlist_error_teaches_the_caller() {
+        let allowed: Vec<String> = ALLOWED_TOOLS.iter().map(|s| s.to_string()).collect();
+        let message = allowlist_error("echo", &allowed);
+        assert!(message.contains("not in allowlist: echo"), "{message}");
+        assert!(message.contains("Allowed: cargo"), "{message}");
+        assert!(message.contains("process.discover_tools"), "{message}");
+    }
+
+    #[test]
+    fn resolve_executable_rejects_path_separators() {        assert!(resolve_executable("../foo").is_err());
         assert!(resolve_executable("dir\\foo.exe").is_err());
         assert!(resolve_executable("foo/bar").is_err());
     }

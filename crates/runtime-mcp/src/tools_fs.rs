@@ -85,9 +85,11 @@ pub struct WriteArgs {
 
 #[derive(Debug, Deserialize)]
 pub struct EditSpecArgs {
+    #[serde(alias = "oldText", alias = "old", alias = "find", alias = "search", alias = "old_string")]
     pub old_text: String,
+    #[serde(alias = "newText", alias = "new", alias = "replace", alias = "replacement", alias = "new_string")]
     pub new_text: String,
-    #[serde(default)]
+    #[serde(default, alias = "count", alias = "occurrences", alias = "expectedOccurrences", alias = "max_matches")]
     #[allow(dead_code)]
     pub expected_occurrences: Option<usize>,
 }
@@ -95,9 +97,50 @@ pub struct EditSpecArgs {
 #[derive(Debug, Deserialize)]
 pub struct EditArgs {
     pub path: String,
+    /// Nested form: `{ "path": ..., "edits": [{ "old_text", "new_text" }] }`
+    #[serde(default)]
     pub edits: Vec<EditSpecArgs>,
+    /// Flat form: `{ "path": ..., "old_text": ..., "new_text": ... }`.
+    /// Accepted because a single replacement is by far the most common call and
+    /// forcing an array around it is a reliable source of malformed requests.
+    #[serde(default, alias = "oldText", alias = "old", alias = "find", alias = "search")]
+    pub old_text: Option<String>,
+    #[serde(default, alias = "newText", alias = "new", alias = "replace", alias = "replacement")]
+    pub new_text: Option<String>,
+    #[serde(default, alias = "count", alias = "occurrences", alias = "expectedOccurrences")]
+    pub expected_occurrences: Option<usize>,
     #[allow(dead_code)]
     pub dry_run: Option<bool>,
+}
+
+impl EditArgs {
+    /// Collapse the nested `edits` array and the flat `old_text`/`new_text`
+    /// form into one list of edits.
+    pub fn into_specs(self) -> Result<Vec<EditSpecArgs>, String> {
+        let mut specs = self.edits;
+        match (self.old_text, self.new_text) {
+            (Some(old_text), Some(new_text)) => specs.push(EditSpecArgs {
+                old_text,
+                new_text,
+                expected_occurrences: self.expected_occurrences,
+            }),
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err("'old_text' was provided without 'new_text'".to_string());
+            }
+            (None, Some(_)) => {
+                return Err("'new_text' was provided without 'old_text'".to_string());
+            }
+        }
+        if specs.is_empty() {
+            return Err(
+                "no edits supplied: pass either 'edits': [{ \"old_text\": ..., \"new_text\": ... }] \
+                 or the flat 'old_text'/'new_text' pair"
+                    .to_string(),
+            );
+        }
+        Ok(specs)
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -26,7 +26,7 @@ use rmcp::ErrorData as McpError;
 use runtime_audit::AuditService;
 use runtime_core::audit::{AuditEvent, AuditEventType};
 use runtime_core::error::Error;
-use runtime_core::traits::{CapabilityGrant, ExecutionRequest, TerminationMode, WorkspaceService};
+use runtime_core::traits::{ExecutionRequest, TerminationMode, WorkspaceService};
 use runtime_core::types::*;
 use runtime_process::{ProcessExecutor, ProcessServiceOps};
 use runtime_workspace::WorkspaceServiceImpl;
@@ -51,7 +51,6 @@ use uuid::Uuid;
 
 /// MCP server for YL Agent Runtime
 pub struct McpServer {
-    runtime: Arc<dyn RuntimeService + Send + Sync>,
     fs: Arc<WorkspaceServiceImpl>,
     roots: Vec<(ProjectId, PathBuf)>,       // ordered; roots[0] is primary for relative paths
     read_only_roots: Vec<PathBuf>,
@@ -61,20 +60,7 @@ pub struct McpServer {
     session_id: SessionId,                  // per-process synthetic session
 }
 
-/// Runtime service trait for MCP server to call
-#[async_trait::async_trait]
-pub trait RuntimeService: Send + Sync {
-    async fn get_status(&self) -> runtime_core::error::Result<RuntimeStatus>;
-    async fn get_capabilities(&self) -> runtime_core::error::Result<Vec<CapabilityGrant>>;
-    async fn list_workspaces(&self) -> runtime_core::error::Result<Vec<String>>;
-    async fn execute_command(
-        &self,
-        command: String,
-        args: Vec<String>,
-    ) -> runtime_core::error::Result<CommandResult>;
-}
-
-/// Runtime status
+/// Runtime status shape returned by `runtime.status`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeStatus {
     pub version: String,
@@ -85,50 +71,13 @@ pub struct RuntimeStatus {
     pub active_sessions: u32,
 }
 
-/// Command result
+/// Command result shape returned by `process.exec`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommandResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
     pub duration_ms: u64,
-}
-
-/// Stub runtime service used when the server is built with `new_for_fs`
-/// (filesystem-only mode): no `RuntimeService` is supplied by the Task 10
-/// wiring, so the `runtime.*`/`process.exec` tools are registered but report
-/// a clear error instead of failing open.
-struct FsOnlyRuntime;
-
-#[async_trait::async_trait]
-impl RuntimeService for FsOnlyRuntime {
-    async fn get_status(&self) -> runtime_core::error::Result<RuntimeStatus> {
-        Err(Error::Internal(
-            "runtime status is not available in filesystem-only MCP mode".to_string(),
-        ))
-    }
-
-    async fn get_capabilities(&self) -> runtime_core::error::Result<Vec<CapabilityGrant>> {
-        Err(Error::Internal(
-            "runtime capabilities are not available in filesystem-only MCP mode".to_string(),
-        ))
-    }
-
-    async fn list_workspaces(&self) -> runtime_core::error::Result<Vec<String>> {
-        Err(Error::Internal(
-            "workspace listing is not available in filesystem-only MCP mode".to_string(),
-        ))
-    }
-
-    async fn execute_command(
-        &self,
-        _command: String,
-        _args: Vec<String>,
-    ) -> runtime_core::error::Result<CommandResult> {
-        Err(Error::Internal(
-            "process execution is not available in filesystem-only MCP mode".to_string(),
-        ))
-    }
 }
 
 impl McpServer {
@@ -140,7 +89,6 @@ impl McpServer {
         process_service: Arc<dyn ProcessServiceOps>,
     ) -> Self {
         Self {
-            runtime: Arc::new(FsOnlyRuntime),
             fs,
             roots,
             read_only_roots,
@@ -184,7 +132,8 @@ impl McpServer {
             Error::PathEscape(msg)
             | Error::PathNotAllowed(msg)
             | Error::Validation(msg)
-            | Error::WorkspaceNotFound(msg) => invalid(msg),
+            | Error::WorkspaceNotFound(msg)
+            | Error::PolicyViolation(msg) => invalid(msg),
             Error::Io(e) => invalid(format!("IO error: {e}")),
             other => McpError::internal_error(other.to_string(), None),
         }
@@ -232,15 +181,37 @@ impl McpServer {
         )
     )]
     async fn runtime_status(&self) -> Result<CallToolResult, McpError> {
-        let status = self
-            .runtime
-            .get_status()
+        let active_processes = self
+            .process_service
+            .list()
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        output_json(&status)
+            .map(|list| list.iter().filter(|p| p.running).count())
+            .unwrap_or(0);
+        output_json(&json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "mode": "filesystem+process",
+            "backend": "native",
+            "isolation_level": "process-scoped",
+            "workspace_roots": self
+                .roots
+                .iter()
+                .map(|(_, root)| root.display().to_string())
+                .collect::<Vec<_>>(),
+            "read_only_roots": self
+                .read_only_roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>(),
+            "tools_registered": Self::tool_router().list_all().len(),
+            "active_processes": active_processes,
+            "active_sessions": 1,
+        }))
     }
 
-    /// Report available backend capabilities.
+    /// Report what this server can actually do, including the executable
+    /// allowlist, so an agent can avoid calls that are guaranteed to fail.
     #[tool(
         name = "runtime.capabilities",
         input_schema = Arc::new(
@@ -251,12 +222,34 @@ impl McpServer {
         )
     )]
     async fn runtime_capabilities(&self) -> Result<CallToolResult, McpError> {
-        let caps = self
-            .runtime
-            .get_capabilities()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        output_json(&caps)
+        output_json(&json!({
+            "filesystem": {
+                "read": true,
+                "write": true,
+                "edit": true,
+                "patch": true,
+                "search": true,
+                "line_numbered_read": true,
+                "root_contained": true,
+                "sensitive_files_blocked": true,
+            },
+            "process": {
+                "exec": true,
+                "long_running": true,
+                "cursor_paged_output": true,
+                "executable_allowlist": runtime_process::ALLOWED_TOOLS,
+                "shell_builtins_available": false,
+            },
+            "runtime": {
+                "git_tools": false,
+                "approval_gate": false,
+                "undo_journal": false,
+            },
+            "limits": {
+                "workspace_roots": self.roots.len(),
+                "read_only_roots": self.read_only_roots.len(),
+            },
+        }))
     }
 
     /// Execute a command and wait for completion.
@@ -737,9 +730,12 @@ impl McpServer {
                     "properties": {
                         "path": { "type": "string" },
                         "edits": { "type": "array" },
+                        "old_text": { "type": "string" },
+                        "new_text": { "type": "string" },
+                        "expected_occurrences": { "type": "integer" },
                         "dry_run": { "type": "boolean" }
                     },
-                    "required": ["path", "edits"]
+                    "required": ["path"]
                 })
             )
             .expect("invalid workspace.edit input schema")
@@ -751,8 +747,10 @@ impl McpServer {
             serde_json::from_value(serde_json::Value::Object(args))
                 .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
         let (project_id, path) = self.resolve_user_path(&PathBuf::from(&args.path))?;
+        let dry_run = args.dry_run.unwrap_or(false);
         let edits: Vec<EditSpec> = args
-            .edits
+            .into_specs()
+            .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?
             .into_iter()
             .map(|edit| EditSpec {
                 old_text: edit.old_text,
@@ -766,7 +764,7 @@ impl McpServer {
                 project_id,
                 &path,
                 &edits,
-                &EditOptions { dry_run: args.dry_run.unwrap_or(false) },
+                &EditOptions { dry_run },
             )
             .await
             .map_err(Self::map_runtime_error)?;
@@ -1407,6 +1405,81 @@ mod tests {
             .await
             .unwrap();
         assert!(content_text(&result).contains("hello"));
+    }
+
+    /// Regression: an MCP client sent `edits: [{oldText, newText}]` and got
+    /// `missing field old_text` because alias rewriting only touched the
+    /// top-level argument map, never the nested edit objects.
+    #[tokio::test]
+    async fn edit_accepts_camel_case_inside_edits_array() {
+        let (server, _dir, _audit) = fixture().await;
+        server
+            .workspace_edit(Parameters(obj(json!({
+                "path": "a.txt",
+                "edits": [{ "oldText": "hello", "newText": "hola" }],
+            }))))
+            .await
+            .unwrap();
+        let read = server
+            .workspace_read(Parameters(obj(json!({"path": "a.txt"}))))
+            .await
+            .unwrap();
+        assert!(content_text(&read).contains("hola"));
+    }
+
+    /// Regression: the flat single-edit form `{path, old_text, new_text}`
+    /// (what most agents try first) must work, not demand an array.
+    #[tokio::test]
+    async fn edit_accepts_flat_old_text_new_text() {
+        let (server, _dir, _audit) = fixture().await;
+        server
+            .workspace_edit(Parameters(obj(json!({
+                "path": "a.txt",
+                "old_text": "hello",
+                "new_text": "bonjour",
+            }))))
+            .await
+            .unwrap();
+        let read = server
+            .workspace_read(Parameters(obj(json!({"path": "a.txt"}))))
+            .await
+            .unwrap();
+        assert!(content_text(&read).contains("bonjour"));
+    }
+
+    /// A call with no edit content at all must fail with a message that says
+    /// what to send, not a raw serde error.
+    #[tokio::test]
+    async fn edit_without_edits_explains_the_expected_shape() {
+        let (server, _dir, _audit) = fixture().await;
+        let err = server
+            .workspace_edit(Parameters(obj(json!({"path": "a.txt"}))))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("old_text") && message.contains("edits"),
+            "unhelpful error: {message}"
+        );
+    }
+
+    /// `runtime.status` and `runtime.capabilities` used to be advertised by
+    /// `tools/list` and then fail with "not available in filesystem-only mode".
+    #[tokio::test]
+    async fn runtime_tools_answer_with_real_data() {
+        let (server, _dir, _audit) = fixture().await;
+
+        let status = server.runtime_status().await.unwrap();
+        let status_text = content_text(&status);
+        assert!(status_text.contains("\"platform\""));
+        assert!(status_text.contains("\"tools_registered\""));
+
+        let caps = server.runtime_capabilities().await.unwrap();
+        let caps_text = content_text(&caps);
+        assert!(
+            caps_text.contains("executable_allowlist"),
+            "capabilities must expose the allowlist: {caps_text}"
+        );
     }
 
     #[tokio::test]

@@ -104,7 +104,7 @@ For remote HTTP access:
 |------|-------------|
 | `workspace.read` | Read file content with byte/line modes |
 | `workspace.write` | Create or overwrite files |
-| `workspace.edit` | Apply find/replace edits (all-or-nothing) |
+| `workspace.edit` | Apply find/replace edits (all-or-nothing). Accepts `edits: [{old_text, new_text}]` **or** the flat `old_text`/`new_text` pair; `oldText`/`newText` also work |
 | `workspace.patch` | Apply unified git diffs |
 | `workspace.replace_text` | Replace occurrences of text |
 | `workspace.search` | Search file contents (regex supported) |
@@ -116,14 +116,14 @@ For remote HTTP access:
 | `workspace.move` | Move/rename file |
 | `workspace.delete` | Delete file or directory |
 | `workspace.allowed_roots` | List configured workspace roots |
-| `process.exec` | Execute command and wait for completion |
+| `process.exec` | Execute command and wait for completion (allowlisted executables only) |
 | `process.start` | Start long-running process |
 | `process.read` | Read process output (cursor-paged) |
 | `process.stop` | Terminate process |
 | `process.list` | List running processes |
 | `process.discover_tools` | Discover installed toolchains |
-| `runtime.status` | Runtime status summary |
-| `runtime.capabilities` | Backend capabilities |
+| `runtime.status` | Runtime status summary (version, platform, roots, tool count) |
+| `runtime.capabilities` | What this server can do, including the executable allowlist |
 
 ## Configuration
 
@@ -261,6 +261,8 @@ Filesystem   Process
 | 415 Unsupported Media Type | Send `Content-Type: application/json` and `Accept: application/json, text/event-stream` |
 | "Unknown argument 'X'" | The tool rejected the field; the error lists the valid argument names |
 | `tool not found` | Tool names are dotted (`workspace.read`), not underscored (`workspace_read`) |
+| "executable not in allowlist: echo" | Only real executables run; `echo`/`cd`/`dir` are shell builtins. Call `runtime.capabilities` for the list |
+| `workspace.edit` "no edits supplied" | Send `edits: [{old_text, new_text}]` or flat `old_text`/`new_text` |
 
 ## Files
 

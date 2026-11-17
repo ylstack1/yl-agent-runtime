@@ -122,9 +122,11 @@ impl ProcessServiceOps for ProcessService {
         // Executable allowlist (name only, no path separators).
         let executor = ProcessExecutor::new();
         if !executor.is_allowed(program) {
-            return Err(Error::PolicyViolation(format!(
-                "executable not in allowlist: {program}"
-            )));
+            let allowed: Vec<String> = crate::ALLOWED_TOOLS
+                .iter()
+                .map(|tool| tool.to_string())
+                .collect();
+            return Err(Error::PolicyViolation(crate::allowlist_error(program, &allowed)));
         }
 
         // Environment security: deny-listed server-env vars are a hard error;

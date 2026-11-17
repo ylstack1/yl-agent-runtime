@@ -87,7 +87,7 @@ pub const ALIASES: &[(&str, &[(&str, &str)])] = &[
 pub const REQUIRED: &[(&str, &[&str])] = &[
     ("workspace.read", &["path"]),
     ("workspace.write", &["path", "content"]),
-    ("workspace.edit", &["path", "edits"]),
+    ("workspace.edit", &["path"]),
     ("workspace.patch", &["diff"]),
     ("workspace.replace_text", &["search", "replacement"]),
     ("workspace.search", &["query"]),
@@ -129,7 +129,7 @@ const KNOWN: &[(&str, &[&str])] = &[
         &["path", "line_start", "line_end", "offset", "max_bytes", "media", "head", "tail", "want_sha256"],
     ),
     ("workspace.write", &["path", "content", "overwrite", "append"]),
-    ("workspace.edit", &["path", "edits", "dry_run"]),
+    ("workspace.edit", &["path", "edits", "old_text", "new_text", "expected_occurrences", "dry_run"]),
     ("workspace.patch", &["diff", "dry_run"]),
     (
         "workspace.replace_text",
