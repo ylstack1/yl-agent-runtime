@@ -55,6 +55,7 @@ pub enum SensitiveVerdict {
 ///
 /// Construction panics on a malformed pattern: an invalid `deny` glob must
 /// fail loudly rather than silently fail-open the path.
+#[derive(Clone)]
 pub struct SensitiveMatcher {
     builtin: GlobSet,
     builtin_patterns: Vec<&'static str>,
