@@ -276,7 +276,7 @@ fn strip_verbatim_prefix(path: &Path) -> PathBuf {
 ///    validation (DNS rebinding protection) and bind to TCP.
 /// 8. Default bind address is 127.0.0.1 (localhost only); pass
 ///    `--allow-remote` to bind 0.0.0.0.
-pub async fn run_http_server(host: String, port: u16, allow_remote: bool) -> Result<()> {
+pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots: Vec<String>) -> Result<()> {
     // 1. Load config.
     let config = match std::env::var("YL_RUNTIME_CONFIG").ok() {
         Some(path) if !path.is_empty() => Config::load_from_file(&PathBuf::from(path))?,
@@ -292,7 +292,7 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool) -> Res
 
     // 2. Merge roots: CLI `--root` replaces config roots when non-empty;
     //    read-only roots append. Every root is canonicalized and must exist.
-    let cli_roots: Vec<PathBuf> = vec![];
+    let cli_roots: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
     let roots: Vec<PathBuf> = if cli_roots.is_empty() {
         config.workspace.roots.clone()
     } else {

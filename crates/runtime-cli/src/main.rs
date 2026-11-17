@@ -62,12 +62,14 @@ enum Commands {
     },
     /// Run the MCP server over Streamable HTTP (remote access)
     Serve {
-        #[arg(short, long, default_value = "127.0.0.1")]
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(short, long, default_value = "8077")]
         port: u16,
         #[arg(long)]
         allow_remote: bool,
+        #[arg(long = "root")]
+        roots: Vec<String>,
     },
 }
 
@@ -130,8 +132,9 @@ async fn main() -> anyhow::Result<()> {
             host,
             port,
             allow_remote,
+            roots,
         } => {
-            commands::run_http_server(host, port, allow_remote).await?;
+            commands::run_http_server(host, port, allow_remote, roots).await?;
         }
     }
     Ok(())
