@@ -10,11 +10,13 @@
 //! - timeouts (graceful terminate -> grace period -> force kill).
 
 use runtime_core::error::{Error, Result};
+use regex::Regex;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,8 +28,8 @@ pub const ALLOWED_TOOLS: &[&str] = &[
 
 /// Environment variables inherited from the caller. Everything else is cleared.
 pub const ENV_WHITELIST: &[&str] = &[
-    "PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "USERPROFILE", "APPDATA",
-    "LOCALAPPDATA", "ProgramFiles", "ProgramData", "COMSPEC",
+    "PATH", "SYSTEMROOT", "TEMP", "USERPROFILE", "APPDATA", "ProgramFiles*",
+    "COMSPEC",
 ];
 
 /// Deny patterns matched (case-insensitively) against the upper-cased key.
@@ -238,19 +240,23 @@ impl ProcessExecutor {
         let stdout_bytes = stdout_thread.join().unwrap();
         let stderr_bytes = stderr_thread.join().unwrap();
 
+        // Redact secrets before head/tail split and before writing spill files.
+        let stdout_redacted = redact(&String::from_utf8_lossy(&stdout_bytes));
+        let stderr_redacted = redact(&String::from_utf8_lossy(&stderr_bytes));
+
         let duration_ms = start.elapsed().as_millis() as u64;
         let exit_code = exit_status.as_ref().and_then(|s| s.code());
 
         let (stdout, stdout_truncated, stdout_path) = spill_stream(
             &command_hash,
             "stdout",
-            &stdout_bytes,
+            stdout_redacted.as_bytes(),
             self.max_output_bytes,
         )?;
         let (stderr, stderr_truncated, stderr_path) = spill_stream(
             &command_hash,
             "stderr",
-            &stderr_bytes,
+            stderr_redacted.as_bytes(),
             self.max_output_bytes,
         )?;
 
@@ -512,6 +518,18 @@ fn glob_match(text: &str, pattern: &str) -> bool {
     pi == p.len()
 }
 
+/// Redact secret-like values in command output: `(token|secret|password|api[_-]?key)=value` -> `[REDACTED]`.
+///
+/// Applied to stdout/stderr *before* the head/tail split and before writing the
+/// spill file, so secrets never appear inline or on disk in plaintext.
+fn redact(text: &str) -> String {
+    static REDACT: OnceLock<Regex> = OnceLock::new();
+    let re = REDACT.get_or_init(|| {
+        Regex::new(r"(?i)(token|secret|password|api[_-]?key)\s*[:=]\s*\S+").unwrap()
+    });
+    re.replace_all(text, "[REDACTED]").to_string()
+}
+
 /// Spill directory for a command: `%TEMP%\yl-runtime\spill\<hash>`.
 fn spill_dir(command_hash: &str) -> Result<PathBuf> {
     let temp = std::env::var("TEMP")
@@ -728,6 +746,27 @@ mod tests {
         assert!(result.stdout.len() < 100_000);
         let content = fs::read_to_string(&stdout_path).expect("spill file readable");
         assert_eq!(content, "x".repeat(100_000) + "\n");
+    }
+
+    #[test]
+    fn output_redaction_hides_secrets() {
+        let _lock = lock();
+        let exec = ProcessExecutor::new();
+        let result = exec
+            .execute(
+                "node",
+                &[
+                    "-e".to_string(),
+                    r#"console.log("API_KEY=secret123"); console.log("token=abc");"#.to_string(),
+                ],
+                None,
+                30,
+            )
+            .unwrap();
+        assert!(result.success, "{:?}", result.error_type);
+        assert!(!result.stdout.contains("secret123"));
+        assert!(!result.stdout.contains("abc"));
+        assert!(result.stdout.contains("[REDACTED]"));
     }
 
     #[cfg(windows)]
