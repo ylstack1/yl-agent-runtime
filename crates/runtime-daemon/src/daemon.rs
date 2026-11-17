@@ -3,6 +3,7 @@
 //! Coordinates all services: policy, workspace, process, terminal, audit,
 //! identity, approval, and execution backends.
 
+use backend_native::NativeBackend;
 use runtime_approval::ApprovalBroker;
 use runtime_audit::AuditService;
 use runtime_core::error::{Error, Result};
@@ -28,6 +29,11 @@ pub struct RuntimeDaemon {
 
 impl RuntimeDaemon {
     pub fn new(config: runtime_config::Config) -> Result<Self> {
+        // Register the native host backend (trusted local, ExecutionProfile
+        // maps to Development) before the daemon is assembled.
+        let backends: Vec<Box<dyn runtime_backend_api::ExecutionBackend>> =
+            vec![Box::new(NativeBackend::new()?)];
+
         Ok(Self {
             config: Arc::new(config),
             policy_engine: Arc::new(runtime_policy::PolicyEngineImpl::new()),
@@ -39,7 +45,7 @@ impl RuntimeDaemon {
             identity_service: Arc::new(runtime_identity::IdentityServiceImpl::new()),
             approval_broker: Arc::new(runtime_approval::ApprovalBrokerImpl::new()),
             sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            backends: Arc::new(RwLock::new(Vec::new())),
+            backends: Arc::new(RwLock::new(backends)),
         })
     }
 

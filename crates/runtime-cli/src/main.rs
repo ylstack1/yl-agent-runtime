@@ -42,13 +42,19 @@ enum Commands {
     Mcp {
         #[arg(short, long, default_value = "stdio")]
         transport: String,
+        #[arg(long = "root")]
+        roots: Vec<String>,
+        #[arg(long = "read-only-root")]
+        read_only_roots: Vec<String>,
+        #[arg(long)]
+        config: Option<String>,
     },
 }
 
 mod commands;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(EnvFilter::from_default_env())
         .finish();
@@ -79,8 +85,19 @@ async fn main() {
         Commands::RegisterWorkspace { path } => {
             commands::register_workspace(&path).await;
         }
-        Commands::Mcp { transport } => {
-            commands::run_mcp_server(&transport).await;
+        Commands::Mcp {
+            transport: _,
+            roots,
+            read_only_roots,
+            config,
+        } => {
+            commands::run_mcp_server(commands::McpOptions {
+                roots,
+                read_only_roots,
+                config,
+            })
+            .await?;
         }
     }
+    Ok(())
 }

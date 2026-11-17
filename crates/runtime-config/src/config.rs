@@ -20,6 +20,7 @@ pub struct Config {
     pub backend: BackendConfig,
     pub transport: TransportConfig,
     pub remote: RemoteConfig,
+    #[serde(default)] pub workspace: WorkspaceConfig,
 }
 
 /// Daemon configuration
@@ -83,6 +84,31 @@ pub struct RemoteConfig {
     pub max_request_size_mb: u64,
 }
 
+/// Workspace configuration: registered file roots and size limits.
+///
+/// Roots may be relative in config; they are canonicalized (and existence
+/// checked) when the MCP server starts up in `run_mcp_server`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    #[serde(default)] pub roots: Vec<PathBuf>,
+    #[serde(default)] pub read_only_roots: Vec<PathBuf>,
+    #[serde(default = "default_ws_max_file_size")] pub max_file_size: u64,
+}
+
+fn default_ws_max_file_size() -> u64 {
+    10_485_760 // 10 MiB
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            read_only_roots: Vec::new(),
+            max_file_size: 10_485_760,
+        }
+    }
+}
+
 impl Config {
     pub fn default() -> Self {
         Self {
@@ -139,6 +165,7 @@ impl Config {
                 rate_limit_per_minute: 100,
                 max_request_size_mb: 10,
             },
+            workspace: WorkspaceConfig::default(),
         }
     }
 
@@ -203,5 +230,85 @@ impl ConfigMigrator {
             to_version: target_version.to_string(),
             migrated,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_toml() -> String {
+        String::from(
+            r#"
+version = "0.1.0"
+data_dir = "./data"
+config_dir = "./config"
+log_dir = "./logs"
+cache_dir = "./cache"
+
+[daemon]
+bind_address = "127.0.0.1"
+port = 0
+idle_timeout_seconds = 3600
+max_sessions = 100
+startup_timeout_seconds = 5
+
+[policy]
+default_profile = "development"
+policy_dir = "./config/policies"
+fail_closed = true
+require_approval_for = []
+
+[audit]
+enabled = true
+retention_days = 90
+max_log_size_mb = 100
+export_format = "jsonl"
+redact_secrets = true
+
+[backend]
+preferred_backend = "native"
+enable_native = true
+enable_windows_sandbox = true
+enable_linux_sandbox = true
+enable_macos_sandbox = true
+enable_arapuca = false
+enable_virtx = false
+
+[transport]
+enable_stdio = true
+enable_streamable_http = false
+http_bind_address = "127.0.0.1"
+http_port = 0
+enable_iroh = false
+
+[remote]
+enabled = false
+pairing_required = true
+session_timeout_seconds = 3600
+rate_limit_per_minute = 100
+max_request_size_mb = 10
+"#,
+        )
+    }
+
+    #[test]
+    fn workspace_section_parses() {
+        let content = format!(
+            "{}\n\n[workspace]\nroots = [\"C:/x\"]\nread_only_roots = []\nmax_file_size = 10485760\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&content).unwrap();
+        assert_eq!(config.workspace.roots, vec![PathBuf::from("C:/x")]);
+        assert_eq!(config.workspace.read_only_roots, Vec::<PathBuf>::new());
+        assert_eq!(config.workspace.max_file_size, 10_485_760);
+    }
+
+    #[test]
+    fn workspace_defaults_when_section_absent() {
+        let config: Config = toml::from_str(&base_toml()).unwrap();
+        assert!(config.workspace.roots.is_empty());
+        assert!(config.workspace.read_only_roots.is_empty());
+        assert_eq!(config.workspace.max_file_size, 10_485_760);
     }
 }

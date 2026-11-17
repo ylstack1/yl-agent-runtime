@@ -18,14 +18,26 @@ use rmcp::{
     handler::server::wrapper::Parameters,
 };
 use rmcp::ErrorData as McpError;
+use runtime_audit::AuditService;
 use runtime_core::traits::CapabilityGrant;
 use runtime_core::types::*;
+use runtime_workspace::WorkspaceServiceImpl;
+use std::path::PathBuf;
 use std::result::Result;
 use std::sync::Arc;
 
 /// MCP server for YL Agent Runtime
 pub struct McpServer {
-    runtime: Arc<dyn RuntimeService + Send + Sync>,
+    runtime: Option<Arc<dyn RuntimeService + Send + Sync>>,
+    /// Task 11 filesystem mode: the workspace service backing the file tools.
+    #[allow(dead_code)]
+    fs: Option<Arc<WorkspaceServiceImpl>>,
+    /// Task 11 filesystem mode: registered `(project_id, root)` pairs.
+    #[allow(dead_code)]
+    roots: Vec<(ProjectId, PathBuf)>,
+    /// Task 11 filesystem mode: the audit service.
+    #[allow(dead_code)]
+    audit: Option<Arc<dyn AuditService>>,
 }
 
 /// Runtime service trait for MCP server to call
@@ -63,7 +75,39 @@ pub struct CommandResult {
 
 impl McpServer {
     pub fn new(runtime: Arc<dyn RuntimeService + Send + Sync>) -> Self {
-        Self { runtime }
+        Self {
+            runtime: Some(runtime),
+            fs: None,
+            roots: Vec::new(),
+            audit: None,
+        }
+    }
+
+    /// Filesystem-backed MCP server (Task 10 wires `run_mcp_server` against
+    /// this constructor; Task 11 implements the actual file tools).
+    ///
+    /// Until Task 11 lands the server answers `initialize` (serverInfo
+    /// "yl-agent-runtime") but every tool call returns a "not configured"
+    /// error rather than failing open.
+    pub fn new_for_fs(
+        fs: Arc<WorkspaceServiceImpl>,
+        roots: Vec<(ProjectId, PathBuf)>,
+        audit: Arc<dyn AuditService>,
+    ) -> Self {
+        Self {
+            runtime: None,
+            fs: Some(fs),
+            roots,
+            audit: Some(audit),
+        }
+    }
+
+    fn runtime_not_configured() -> McpError {
+        McpError::internal_error(
+            "McpServer was built with new_for_fs (filesystem stub); file \
+             tools are implemented in Task 11",
+            None,
+        )
     }
 }
 
@@ -76,8 +120,11 @@ impl McpServer {
     /// Report runtime status and capability summary.
     #[tool(name = "runtime.status")]
     async fn runtime_status(&self) -> Result<CallToolResult, McpError> {
-        let status = self
+        let runtime = self
             .runtime
+            .as_ref()
+            .ok_or_else(Self::runtime_not_configured)?;
+        let status = runtime
             .get_status()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -89,8 +136,11 @@ impl McpServer {
     /// Report available backend capabilities.
     #[tool(name = "runtime.capabilities")]
     async fn runtime_capabilities(&self) -> Result<CallToolResult, McpError> {
-        let caps = self
+        let runtime = self
             .runtime
+            .as_ref()
+            .ok_or_else(Self::runtime_not_configured)?;
+        let caps = runtime
             .get_capabilities()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -102,8 +152,11 @@ impl McpServer {
     /// List registered workspaces.
     #[tool(name = "workspace.list")]
     async fn workspace_list(&self) -> Result<CallToolResult, McpError> {
-        let workspaces = self
+        let runtime = self
             .runtime
+            .as_ref()
+            .ok_or_else(Self::runtime_not_configured)?;
+        let workspaces = runtime
             .list_workspaces()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -136,8 +189,11 @@ impl McpServer {
         args: Parameters<process_exec::Args>,
     ) -> Result<CallToolResult, McpError> {
         let args = args.0;
-        let result = self
+        let runtime = self
             .runtime
+            .as_ref()
+            .ok_or_else(Self::runtime_not_configured)?;
+        let result = runtime
             .execute_command(args.command, args.args.unwrap_or_default())
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
