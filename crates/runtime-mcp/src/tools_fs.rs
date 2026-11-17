@@ -342,6 +342,63 @@ pub struct ProcessListArgs {
 pub struct ProcessDiscoverToolsArgs {}
 
 // ---------------------------------------------------------------------------
+// Git tools
+// ---------------------------------------------------------------------------
+
+/// Find the git root of a workspace root.
+#[derive(Debug, Deserialize)]
+pub struct GitRootArgs {
+    #[allow(dead_code)]
+    pub project_id: Option<String>,
+}
+
+/// Show the working tree status.
+#[derive(Debug, Deserialize)]
+pub struct GitStatusArgs {
+    #[allow(dead_code)]
+    pub project_id: Option<String>,
+}
+
+/// Show changes between commits, commit and working tree, etc.
+#[derive(Debug, Deserialize)]
+pub struct GitDiffArgs {
+    #[allow(dead_code)]
+    pub project_id: Option<String>,
+    #[allow(dead_code)]
+    pub path: Option<String>,
+    #[allow(dead_code)]
+    pub staged: Option<bool>,
+}
+
+/// Show commit logs.
+#[derive(Debug, Deserialize)]
+pub struct GitLogArgs {
+    #[allow(dead_code)]
+    pub project_id: Option<String>,
+    #[allow(dead_code)]
+    pub max_count: Option<u64>,
+    #[allow(dead_code)]
+    pub path: Option<String>,
+}
+
+/// Show the current branch name.
+#[derive(Debug, Deserialize)]
+pub struct GitBranchArgs {
+    #[allow(dead_code)]
+    pub project_id: Option<String>,
+}
+
+/// Stage specific files and commit them. `git add -A` / `--all` is blocked.
+#[derive(Debug, Deserialize)]
+pub struct GitCommitArgs {
+    #[allow(dead_code)]
+    pub project_id: Option<String>,
+    pub message: String,
+    #[allow(dead_code)]
+    pub files: Option<Vec<String>>,
+}
+
+// ---------------------------------------------------------------------------
 // Tree walking
 // ---------------------------------------------------------------------------
 
