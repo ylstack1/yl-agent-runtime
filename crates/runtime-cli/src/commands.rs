@@ -163,6 +163,7 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
             .await?;
         roots_pairs.push((id, root));
     }
+    let server_read_only_roots = read_only_roots.clone();
     for root in read_only_roots {
         let id = service.register(root.clone(), ExecutionProfile::Inspect).await?;
         roots_pairs.push((id, root));
@@ -173,8 +174,8 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
     let audit: Arc<dyn AuditService> =
         Arc::new(AuditServiceImpl::new().with_log_path(config.data_dir.join("audit.jsonl")));
 
-    // 6. Build the MCP server (Task 11 `new_for_fs` constructor skeleton).
-    let mcp_server = runtime_mcp::McpServer::new_for_fs(service, roots_pairs, audit);
+    // 6. Build the MCP server (Task 11 `new_for_fs`).
+    let mcp_server = runtime_mcp::McpServer::new_for_fs(service, roots_pairs, audit, server_read_only_roots);
 
     // 7. Serve over stdio.
     use rmcp::ServiceExt;

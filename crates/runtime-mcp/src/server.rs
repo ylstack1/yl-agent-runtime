@@ -131,12 +131,13 @@ impl McpServer {
         fs: Arc<WorkspaceServiceImpl>,
         roots: Vec<(ProjectId, PathBuf)>,
         audit: Arc<dyn AuditService>,
+        read_only_roots: Vec<PathBuf>,
     ) -> Self {
         Self {
             runtime: Arc::new(FsOnlyRuntime),
             fs,
             roots,
-            read_only_roots: Vec::new(),
+            read_only_roots,
             audit,
             principal_agent: "mcp-local".to_string(),
             session_id: SessionId::new(),
@@ -295,7 +296,11 @@ impl McpServer {
                         "line_start": { "type": "integer" },
                         "line_end": { "type": "integer" },
                         "offset": { "type": "integer" },
-                        "max_bytes": { "type": "integer" }
+                        "max_bytes": { "type": "integer" },
+                        "media": { "type": "boolean" },
+                        "head": { "type": "integer" },
+                        "tail": { "type": "integer" },
+                        "want_sha256": { "type": "boolean" }
                     },
                     "required": ["path"]
                 })
@@ -340,11 +345,11 @@ impl McpServer {
             max_bytes: args.max_bytes,
             line_start: args.line_start,
             line_end: args.line_end,
-            head: None,
-            tail: None,
+            head: args.head,
+            tail: args.tail,
             line_numbers: true,
-            media: false,
-            want_sha256: false,
+            media: args.media.unwrap_or(false),
+            want_sha256: args.want_sha256.unwrap_or(false),
         };
         match self
             .fs
@@ -570,18 +575,15 @@ impl McpServer {
             }
         };
         let (project_id, path) = self.resolve_user_path(&PathBuf::from(&path))?;
-        let edits = vec![EditSpec {
-            old_text: args.search,
-            new_text: args.replacement,
-            expected_occurrences: Some(args.max_matches),
-        }];
         let outcome = self
             .fs
-            .edit_text(
+            .replace_text(
                 project_id,
                 &path,
-                &edits,
-                &EditOptions { dry_run: args.dry_run.unwrap_or(false) },
+                &args.search,
+                &args.replacement,
+                args.max_matches,
+                args.dry_run.unwrap_or(false),
             )
             .await
             .map_err(Self::map_runtime_error)?;
@@ -607,7 +609,8 @@ impl McpServer {
                         "is_regex": { "type": "boolean" },
                         "case_sensitive": { "type": "boolean" },
                         "include": { "type": "array", "items": { "type": "string" } },
-                        "exclude": { "type": "array", "items": { "type": "string" } }
+                        "exclude": { "type": "array", "items": { "type": "string" } },
+                        "context": { "type": "integer", "minimum": 0, "maximum": 5 }
                     },
                     "required": ["query"]
                 })
@@ -627,7 +630,7 @@ impl McpServer {
             case_sensitive: args.case_sensitive,
             include: args.include,
             exclude: args.exclude,
-            context: 0,
+            context: args.context,
             max_results: args.max_results.min(5_000),
             files_only: false,
             include_hidden: false,
@@ -1022,7 +1025,12 @@ mod tests {
             .await
             .expect("register workspace");
         let audit = Arc::new(AuditServiceImpl::new());
-        let server = McpServer::new_for_fs(fs, vec![(id, dir.path().to_path_buf())], audit.clone());
+        let server = McpServer::new_for_fs(
+            fs,
+            vec![(id, dir.path().to_path_buf())],
+            audit.clone(),
+            vec![],
+        );
         (server, dir, audit)
     }
 
@@ -1139,6 +1147,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allowed_roots_returns_configured_read_only_roots() {
+        let fs = Arc::new(WorkspaceServiceImpl::new());
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let id = fs
+            .register(dir.path().to_path_buf(), ExecutionProfile::Development)
+            .await
+            .expect("register workspace");
+        let audit = Arc::new(AuditServiceImpl::new());
+        let server = McpServer::new_for_fs(
+            fs,
+            vec![(id, dir.path().to_path_buf())],
+            audit,
+            vec![dir.path().to_path_buf()],
+        );
+        let result = server
+            .workspace_allowed_roots(Parameters(obj(json!({}))))
+            .await
+            .unwrap();
+        let text = content_text(&result);
+        assert!(text.contains("\"read_only_roots\""), "unexpected: {text}");
+    }
+
+    #[tokio::test]
+    async fn read_head_is_plumbed_from_args() {
+        let (server, _dir, _audit) = fixture().await;
+        server
+            .workspace_write(Parameters(obj(json!({
+                "path": "lines.txt",
+                "content": "one\nneedle two\nthree\n",
+                "overwrite": true
+            }))))
+            .await
+            .unwrap();
+        let result = server
+            .workspace_read(Parameters(obj(json!({
+                "path": "lines.txt",
+                "head": 1
+            }))))
+            .await
+            .unwrap();
+        let text = content_text(&result);
+        assert!(text.contains("one"), "expected first line, got: {text}");
+        assert!(
+            !text.contains("three"),
+            "head must limit the read window, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_text_default_max_matches_replaces_all_occurrences() {
+        let (server, _dir, _audit) = fixture().await;
+        server
+            .workspace_write(Parameters(obj(json!({
+                "path": "multi.txt",
+                "content": "alpha\nbeta\nalpha\n",
+                "overwrite": true
+            }))))
+            .await
+            .unwrap();
+
+        // Default max_matches (100) must behave as "replace up to all N".
+        let result = server
+            .workspace_replace_text(Parameters(obj(json!({
+                "path": "multi.txt",
+                "search": "alpha",
+                "replacement": "ALPHA"
+            }))))
+            .await
+            .unwrap();
+        assert!(content_text(&result).contains("\"applied_edits\":1"));
+
+        let after = server
+            .workspace_read(Parameters(obj(json!({"path": "multi.txt"}))))
+            .await
+            .unwrap();
+        let text = content_text(&after);
+        assert!(text.contains("ALPHA"), "expected replacement, got: {text}");
+        assert!(
+            !text.contains("alpha"),
+            "both occurrences should have been replaced, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_text_single_occurrence_still_replaces_one() {
+        let (server, _dir, _audit) = fixture().await;
+        server
+            .workspace_write(Parameters(obj(json!({
+                "path": "single.txt",
+                "content": "only needle here\n",
+                "overwrite": true
+            }))))
+            .await
+            .unwrap();
+
+        let result = server
+            .workspace_replace_text(Parameters(obj(json!({
+                "path": "single.txt",
+                "search": "needle",
+                "replacement": "NEEDLE"
+            }))))
+            .await
+            .unwrap();
+        assert!(content_text(&result).contains("\"applied_edits\":1"));
+
+        let after = server
+            .workspace_read(Parameters(obj(json!({"path": "single.txt"}))))
+            .await
+            .unwrap();
+        let text = content_text(&after);
+        assert!(text.contains("NEEDLE"), "expected replacement, got: {text}");
+    }
+
+    #[tokio::test]
+    async fn search_context_is_accepted_and_honored() {
+        let (server, _dir, _audit) = fixture().await;
+        server
+            .workspace_write(Parameters(obj(json!({
+                "path": "ctx.txt",
+                "content": "alpha\nneedle here\ngamma\n",
+                "overwrite": true
+            }))))
+            .await
+            .unwrap();
+
+        let result = server
+            .workspace_search(Parameters(obj(json!({ "query": "needle", "context": 1 }))))
+            .await
+            .unwrap();
+        let text = content_text(&result);
+        assert!(
+            text.contains("\"before\"") && text.contains("\"after\""),
+            "context must be plumbed into match before/after, got: {text}"
+        );
+        assert!(
+            text.contains("alpha") && text.contains("gamma"),
+            "context lines should be returned around the match, got: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn list_tool_returns_directory_entries() {
         let (server, _dir, _audit) = fixture().await;
         let result = server
@@ -1152,7 +1301,7 @@ mod tests {
     async fn zero_roots_rejected() {
         let fs = Arc::new(WorkspaceServiceImpl::new());
         let audit = Arc::new(AuditServiceImpl::new());
-        let server = McpServer::new_for_fs(fs, vec![], audit);
+        let server = McpServer::new_for_fs(fs, vec![], audit, vec![]);
         let err = server
             .workspace_read(Parameters(obj(json!({"path": "a.txt"}))))
             .await

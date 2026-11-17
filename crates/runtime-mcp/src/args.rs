@@ -75,7 +75,24 @@ pub const REQUIRED: &[(&str, &[&str])] = &[
 /// `input_schema`; alias canonical targets are added on top in
 /// `base_keys_for`.
 const KNOWN: &[(&str, &[&str])] = &[
-    ("workspace.read", &["path", "line_start", "line_end", "offset", "max_bytes"]),
+    (
+        "workspace.read",
+        &[
+            "path",
+            "line_start",
+            "line_end",
+            "offset",
+            "max_bytes",
+            "media",
+            "head",
+            "tail",
+            "want_sha256",
+        ],
+    ),
+    (
+        "workspace.read_file",
+        &["path", "line_start", "line_end", "offset", "max_bytes", "media", "head", "tail", "want_sha256"],
+    ),
     ("workspace.write", &["path", "content", "overwrite", "append"]),
     ("workspace.edit", &["path", "edits", "dry_run"]),
     ("workspace.patch", &["diff", "dry_run"]),
@@ -85,7 +102,15 @@ const KNOWN: &[(&str, &[&str])] = &[
     ),
     (
         "workspace.search",
-        &["query", "max_results", "is_regex", "case_sensitive", "include", "exclude"],
+        &[
+            "query",
+            "max_results",
+            "is_regex",
+            "case_sensitive",
+            "include",
+            "exclude",
+            "context",
+        ],
     ),
     ("workspace.find_files", &["path", "pattern", "max_results"]),
     ("workspace.list", &["path", "depth", "max_entries", "include_hidden", "sort_by"]),
@@ -102,7 +127,17 @@ const KNOWN: &[(&str, &[&str])] = &[
 /// as `old_text` are valid arguments even though they are not struct fields).
 fn base_keys_for(tool: &str) -> Vec<&'static str> {
     let base: Vec<&'static str> = match tool {
-        "workspace.read_file" => vec!["path", "line_start", "line_end"],
+        "workspace.read_file" => vec![
+            "path",
+            "line_start",
+            "line_end",
+            "offset",
+            "max_bytes",
+            "media",
+            "head",
+            "tail",
+            "want_sha256",
+        ],
         "workspace.write_file" => vec!["path", "content", "overwrite"],
         _ => KNOWN
             .iter()

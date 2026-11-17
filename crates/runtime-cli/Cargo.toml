@@ -28,8 +28,6 @@ runtime-workspace = { path = "../runtime-workspace" }
 runtime-mcp = { path = "../runtime-mcp" }
 runtime-audit = { path = "../runtime-audit" }
 runtime-toolchain = { path = "../runtime-toolchain" }
-backend-native = { path = "../backend-native" }
-runtime-backend-api = { path = "../runtime-backend-api" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

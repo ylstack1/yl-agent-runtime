@@ -50,6 +50,19 @@ fn unknown_key_suggests_did_you_mean() {
 }
 
 #[test]
+fn search_context_is_accepted_and_plumbed() {
+    let result = normalize_args(
+        "workspace.search",
+        &obj(json!({ "query": "needle", "context": 2 })),
+    )
+    .unwrap();
+    assert_eq!(result.get("context"), Some(&json!(2)));
+
+    let defaulted = normalize_args("workspace.search", &obj(json!({ "query": "needle" }))).unwrap();
+    assert!(defaulted.get("context").is_none());
+}
+
+#[test]
 fn unknown_key_lists_valid() {
     let msg = err_text(normalize_args("workspace.search", &obj(json!({"zzz": 1}))));
     assert!(msg.contains("Valid arguments:"), "unexpected message: {msg}");

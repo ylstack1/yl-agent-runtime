@@ -40,8 +40,6 @@ enum Commands {
     },
     /// Run the MCP server
     Mcp {
-        #[arg(short, long, default_value = "stdio")]
-        transport: String,
         #[arg(long = "root")]
         roots: Vec<String>,
         #[arg(long = "read-only-root")]
@@ -86,7 +84,6 @@ async fn main() -> anyhow::Result<()> {
             commands::register_workspace(&path).await;
         }
         Commands::Mcp {
-            transport: _,
             roots,
             read_only_roots,
             config,

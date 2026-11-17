@@ -53,57 +53,155 @@ pub fn edit_text(path: &Path, edits: &[EditSpec], opts: &EditOptions) -> Result<
     let dominant = detect_dominant_eol(raw.as_bytes());
     let original_lf = raw.replace("\r\n", "\n");
 
-    let normalize = |s: &str| s.replace("\r\n", "\n");
     let total = edits.len();
 
     let mut content = original_lf.clone();
     for (i, spec) in edits.iter().enumerate() {
-        let edit_no = i + 1;
-        let old = normalize(&spec.old_text);
-        let new = normalize(&spec.new_text);
-
-        if old == new {
-            return Err(Error::Validation(format!(
-                "Edit {edit_no}: old_text equals new_text; nothing would change"
-            )));
-        }
-
-        let expected = spec.expected_occurrences.unwrap_or(1);
-        let count = count_occurrences(&content, &old);
-
-        if count == 0 {
-            stage2_replace(&mut content, edit_no, total, &old, &new)?;
-        } else if count == expected {
-            content = if expected == 1 {
-                // expected == 1: replace the first occurrence only.
-                content.replacen(&old, &new, 1)
-            } else {
-                // expected > 1: replace all occurrences.
-                content.replacen(&old, &new, usize::MAX)
-            };
-        } else if spec.expected_occurrences.is_none() {
-            // defaulted expected_occurrences with multiple exact matches:
-            // fall through to the helpful stage-2 window analysis.
-            stage2_replace(&mut content, edit_no, total, &old, &new)?;
-        } else {
-            return Err(Error::Validation(format!(
-                "Edit {edit_no}: expected {expected} occurrence(s), found {count}. Pass expected_occurrences to replace all {count} of them."
-            )));
-        }
+        apply_edit(&mut content, spec, i + 1, total)?;
     }
 
+    finalize_edit(&raw, edits, dominant, &original_lf, &content, path, opts)
+}
+
+/// Replace up to `max_matches` occurrences of `old_text` with `new_text` in
+/// `path` (count-then-replace-all). Replaces `min(max_matches, occurrences)`
+/// occurrences; a single-occurrence file is replaced as before, and a missing
+/// needle surfaces the standard not-found error.
+pub fn replace_text(
+    path: &Path,
+    old_text: &str,
+    new_text: &str,
+    max_matches: usize,
+    opts: &EditOptions,
+) -> Result<EditOutcome> {
+    if detect_binary_probe(path)? {
+        return Err(Error::Validation("Binary file cannot be edited".to_string()));
+    }
+
+    let raw = std::fs::read(path)?;
+    let raw = String::from_utf8(raw).map_err(|_| Error::Validation("File is not valid UTF-8".to_string()))?;
+
+    let dominant = detect_dominant_eol(raw.as_bytes());
+    let original_lf = raw.replace("\r\n", "\n");
+
+    let old = old_text.replace("\r\n", "\n");
+    let new = new_text.replace("\r\n", "\n");
+
+    if old == new {
+        return Err(Error::Validation(
+            "Edit 1: old_text equals new_text; nothing would change".to_string(),
+        ));
+    }
+
+    let count = count_occurrences(&original_lf, &old);
+    let n = if count == 0 { 0 } else { count.min(max_matches) };
+
+    let mut content = original_lf.clone();
+    if n > 0 {
+        replace_occurrences(&mut content, &old, &new, n)?;
+    } else {
+        // Needle not found: surface the standard not-found error via the
+        // edit pipeline's helpful fallback.
+        let spec = EditSpec {
+            old_text: old_text.to_string(),
+            new_text: new_text.to_string(),
+            expected_occurrences: None,
+        };
+        let mut not_found_content = original_lf.clone();
+        apply_edit(&mut not_found_content, &spec, 1, 1)?;
+        return finalize_edit(&raw, std::slice::from_ref(&spec), dominant, &original_lf, &not_found_content, path, opts);
+    }
+
+    let spec = EditSpec {
+        old_text: old_text.to_string(),
+        new_text: new_text.to_string(),
+        expected_occurrences: Some(n),
+    };
+    finalize_edit(&raw, std::slice::from_ref(&spec), dominant, &original_lf, &content, path, opts)
+}
+
+/// Replace the first `n` occurrences of `old` with `new` in `content` (LF
+/// view). `n` must not exceed the occurrence count (the caller clamps with
+/// `min(max_matches, occurrences)` before calling).
+fn replace_occurrences(content: &mut String, old: &str, new: &str, n: usize) -> Result<()> {
+    let mut replaced = 0usize;
+    let mut search_from = 0usize;
+    while replaced < n {
+        let Some(pos) = content[search_from..].find(old).map(|offset| search_from + offset) else {
+            return Err(Error::Validation(format!(
+                "Edit 1: expected {n} occurrence(s), found {replaced}."
+            )));
+        };
+        content.replace_range(pos..pos + old.len(), new);
+        replaced += 1;
+        search_from = pos + new.len();
+    }
+    Ok(())
+}
+
+/// Apply one edit against the evolving content. With `expected_occurrences`
+/// set to an exact count, the edit replaces exactly that many occurrences
+/// (all of them, or the first when the count is 1); when unset it falls back
+/// to the helpful line-window analysis.
+fn apply_edit(content: &mut String, spec: &EditSpec, edit_no: usize, total: usize) -> Result<()> {
+    let old = spec.old_text.replace("\r\n", "\n");
+    let new = spec.new_text.replace("\r\n", "\n");
+
+    if old == new {
+        return Err(Error::Validation(format!(
+            "Edit {edit_no}: old_text equals new_text; nothing would change"
+        )));
+    }
+
+    let expected = spec.expected_occurrences.unwrap_or(1);
+    let count = count_occurrences(content, &old);
+
+    if count == 0 {
+        stage2_replace(content, edit_no, total, &old, &new)?;
+    } else if count == expected {
+        if expected == 1 {
+            // expected == 1: replace the first occurrence only.
+            *content = content.replacen(&old, &new, 1);
+        } else {
+            // expected > 1: replace all occurrences.
+            *content = content.replacen(&old, &new, usize::MAX);
+        }
+    } else if spec.expected_occurrences.is_none() {
+        // defaulted expected_occurrences with multiple exact matches:
+        // fall through to the helpful stage-2 window analysis.
+        stage2_replace(content, edit_no, total, &old, &new)?;
+    } else {
+        return Err(Error::Validation(format!(
+            "Edit {edit_no}: expected {expected} occurrence(s), found {count}. Pass expected_occurrences to replace all {count} of them."
+        )));
+    }
+
+    Ok(())
+}
+
+/// Compute the final content bytes, diff, and write (or dry-run) for an edit
+/// pass over the LF-normalized `original_lf` view.
+fn finalize_edit(
+    raw: &str,
+    edits: &[EditSpec],
+    dominant: Eol,
+    original_lf: &str,
+    content: &str,
+    path: &Path,
+    opts: &EditOptions,
+) -> Result<EditOutcome> {
     if content == original_lf {
         return Err(Error::Validation("No edits changed the file".to_string()));
     }
 
     // EOL-preserving write: byte-exact first, then dominant-EOL normalized.
-    let final_bytes = final_bytes(&raw, edits, dominant, &content);
+    let final_bytes = final_bytes(raw, edits, dominant, content);
 
-    let diff = render_edit_diff(&original_lf, &content, path);
+    let diff = render_edit_diff(original_lf, content, path);
 
     if opts.dry_run {
         return Ok(EditOutcome {
-            applied_edits: total,
+            applied_edits: edits.len(),
             diff: Some(diff),
             dry_run: true,
         });
@@ -120,7 +218,7 @@ pub fn edit_text(path: &Path, edits: &[EditSpec], opts: &EditOptions) -> Result<
     )?;
 
     Ok(EditOutcome {
-        applied_edits: total,
+        applied_edits: edits.len(),
         diff: Some(diff),
         dry_run: false,
     })
@@ -329,14 +427,16 @@ fn render_edit_diff(old: &str, new: &str, path: &Path) -> String {
     diff
 }
 
-/// Naive non-overlapping sliding match count.
-fn count_occurrences(haystack: &str, needle: &str) -> usize {
+/// Naive non-overlapping sliding match count. Line endings are normalized
+/// (CRLF → LF) before matching, mirroring the edit needle normalization.
+pub fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    let needle = needle.replace("\r\n", "\n");
     if needle.is_empty() {
         return 0;
     }
     let mut count = 0usize;
     let mut start = 0usize;
-    while let Some(pos) = haystack[start..].find(needle) {
+    while let Some(pos) = haystack[start..].find(needle.as_str()) {
         count += 1;
         start += pos + needle.len();
     }
@@ -482,6 +582,54 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("expected 2 occurrence(s), found 3"));
         assert_eq!(std::fs::read(&path).expect("read"), b"x\nx\nx\n");
+    }
+
+    fn replace(
+        path: &Path,
+        old_text: &str,
+        new_text: &str,
+        max_matches: usize,
+    ) -> Result<EditOutcome> {
+        replace_text(path, old_text, new_text, max_matches, &EditOptions::default())
+    }
+
+    #[test]
+    fn replace_text_default_cap_replaces_all_occurrences() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("multi.txt");
+        seed(&path, b"alpha\nbeta\nalpha\n");
+        let outcome = replace(&path, "alpha", "ALPHA", 100).expect("replace");
+        assert_eq!(outcome.applied_edits, 1);
+        assert_eq!(std::fs::read(&path).expect("read"), b"ALPHA\nbeta\nALPHA\n");
+    }
+
+    #[test]
+    fn replace_text_respects_cap_below_occurrence_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cap.txt");
+        seed(&path, b"x\nx\nx\n");
+        let outcome = replace(&path, "x", "y", 2).expect("replace");
+        assert_eq!(outcome.applied_edits, 1);
+        assert_eq!(std::fs::read(&path).expect("read"), b"y\ny\nx\n");
+    }
+
+    #[test]
+    fn replace_text_single_occurrence_replaces_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("single.txt");
+        seed(&path, b"only needle here\n");
+        let outcome = replace(&path, "needle", "NEEDLE", 100).expect("replace");
+        assert_eq!(outcome.applied_edits, 1);
+        assert_eq!(std::fs::read(&path).expect("read"), b"only NEEDLE here\n");
+    }
+
+    #[test]
+    fn replace_text_missing_needle_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing.txt");
+        seed(&path, b"nothing here\n");
+        let err = replace(&path, "zzz", "y", 100).unwrap_err();
+        assert!(err.to_string().contains("Could not find exact match"));
     }
 
     #[test]

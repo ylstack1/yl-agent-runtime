@@ -5,7 +5,7 @@
 //! tree walking (`walk_tree`), and the per-tool argument structs consumed by
 //! the tool methods in `server.rs`.
 
-use globset::{GlobBuilder, GlobSetBuilder, GlobSet};
+use ignore::overrides::{Override, OverrideBuilder};
 use ignore::WalkBuilder;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -63,6 +63,14 @@ pub struct ReadArgs {
     pub offset: Option<u64>,
     #[allow(dead_code)]
     pub max_bytes: Option<u64>,
+    #[allow(dead_code)]
+    pub media: Option<bool>,
+    #[allow(dead_code)]
+    pub head: Option<u64>,
+    #[allow(dead_code)]
+    pub tail: Option<u64>,
+    #[allow(dead_code)]
+    pub want_sha256: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +145,8 @@ pub struct SearchArgs {
     #[serde(default)]
     #[allow(dead_code)]
     pub exclude: Vec<String>,
+    #[serde(default)]
+    pub context: u32,
 }
 
 fn default_search_max_results() -> usize {
@@ -264,35 +274,47 @@ struct TreeNode {
     children: Vec<usize>,
 }
 
-fn build_glob_set(patterns: &[String]) -> GlobSet {
-    let mut builder = GlobSetBuilder::new();
+/// Build gitignore-style override rules (`!` = exclude) for the caller-supplied
+/// `exclude_patterns`, so the walker prunes excluded subtrees during descent
+/// instead of filtering children after the fact (which let excluded directories
+/// leak through via mis-parented absolute/relative path comparisons).
+fn build_exclude_overrides(root: &Path, patterns: &[String]) -> Option<Override> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let mut builder = OverrideBuilder::new(root);
     for pattern in patterns {
-        if let Ok(glob) = GlobBuilder::new(pattern).literal_separator(true).build() {
-            builder.add(glob);
+        // Fail-soft on invalid patterns, mirroring the previous glob fallback.
+        if builder.add(&format!("!{pattern}")).is_err() {
+            continue;
         }
     }
-    builder.build().unwrap_or(GlobSet::empty())
+    builder.build().ok()
 }
 
 /// Walk `root` up to `max_depth` and emit a nested JSON array of
 /// `{name, type, children?}` nodes. Directories at (or beyond) the depth
-/// limit carry `children: []`; files carry `children: None`.
+/// limit carry `children: []`; files carry `children: None`. Excluded
+/// subtrees (via `exclude_patterns`) are pruned before descent, so their
+/// contents never enter the output.
 pub fn walk_tree(
     root: &Path,
     max_depth: Option<usize>,
     exclude_patterns: &[String],
 ) -> Result<Vec<serde_json::Value>, TreeBudgetExceeded> {
-    let exclude = build_glob_set(exclude_patterns);
+    let overrides = build_exclude_overrides(root, exclude_patterns);
     let mut walker = WalkBuilder::new(root);
     if let Some(depth) = max_depth {
         walker.max_depth(Some(depth));
     }
     walker.hidden(true).ignore(true).require_git(false);
+    if let Some(overrides) = &overrides {
+        walker.overrides(overrides.clone());
+    }
 
     let mut nodes: Vec<TreeNode> = Vec::new();
     let mut by_path: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
     let mut top_level: Vec<usize> = Vec::new();
-    let mut excluded_dirs: Vec<PathBuf> = Vec::new();
     let mut count: usize = 0;
 
     for entry in walker.build() {
@@ -309,23 +331,10 @@ pub fn walk_tree(
         if path == root {
             continue;
         }
-        let rel = path.strip_prefix(root).unwrap_or(&path);
-        let rel_str = rel.to_string_lossy();
 
-        let file_type = entry.file_type();
-        if exclude.is_match(rel_str.as_ref()) {
-            if file_type.map_or(false, |ft| ft.is_dir()) {
-                excluded_dirs.push(path);
-            }
-            continue;
-        }
-        if excluded_dirs.iter().any(|dir| rel.starts_with(dir)) {
-            continue;
-        }
-
-        let r#type = if file_type.map_or(false, |ft| ft.is_dir()) {
+        let r#type = if entry.file_type().map_or(false, |ft| ft.is_dir()) {
             "directory"
-        } else if file_type.map_or(false, |ft| ft.is_symlink()) {
+        } else if entry.file_type().map_or(false, |ft| ft.is_symlink()) {
             "symlink"
         } else {
             "file"
@@ -441,4 +450,59 @@ pub fn walk_shallow(
     }
 
     (entries, hidden_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed_tree(root: &Path) {
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(root.join("src").join("a.txt"), "hello\n").expect("write src/a.txt");
+        std::fs::create_dir_all(root.join("node_modules")).expect("create node_modules");
+        std::fs::write(root.join("node_modules").join("x.js"), "module.exports = 1;\n").expect("write x.js");
+        std::fs::create_dir_all(root.join("dist")).expect("create dist");
+        std::fs::write(root.join("dist").join("b.js"), "bundle\n").expect("write b.js");
+    }
+
+    fn collect_names(nodes: &[serde_json::Value]) -> Vec<String> {
+        let mut out = Vec::new();
+        for node in nodes {
+            out.push(node["name"].as_str().unwrap_or_default().to_string());
+            if let Some(children) = node["children"].as_array() {
+                out.extend(collect_names(children));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn tree_exclude_pattern_prunes_subtree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_tree(dir.path());
+
+        let nodes = walk_tree(dir.path(), None, &["node_modules".to_string()]).expect("tree walk");
+        let names = collect_names(&nodes);
+        assert!(
+            !names.iter().any(|n| n == "node_modules"),
+            "excluded subtree leaked into tree output: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "src") && names.iter().any(|n| n == "dist"),
+            "non-excluded entries should remain: {names:?}"
+        );
+    }
+
+    #[test]
+    fn tree_without_excludes_lists_all_subtrees() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_tree(dir.path());
+
+        let nodes = walk_tree(dir.path(), None, &[]).expect("tree walk");
+        let names = collect_names(&nodes);
+        assert!(
+            names.iter().any(|n| n == "node_modules"),
+            "unfiltered tree should include the subtree: {names:?}"
+        );
+    }
 }

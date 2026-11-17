@@ -573,6 +573,28 @@ impl WorkspaceServiceImpl {
         edit::edit_text(&contained.absolute_path, edits, opts)
     }
 
+    /// Replace up to `max_matches` occurrences of `old_text` with `new_text`
+    /// in a validated (write-mode, sensitive-checked) path of the workspace.
+    /// Implemented on top of the edit engine's count-then-replace-all logic.
+    pub async fn replace_text(
+        &self,
+        project_id: ProjectId,
+        path: &Path,
+        old_text: &str,
+        new_text: &str,
+        max_matches: usize,
+        dry_run: bool,
+    ) -> Result<EditOutcome> {
+        let contained = self.validate_write(project_id, path)?;
+        edit::replace_text(
+            &contained.absolute_path,
+            old_text,
+            new_text,
+            max_matches,
+            &EditOptions { dry_run },
+        )
+    }
+
     /// Apply a unified/git diff against the workspace root for `project_id`.
     ///
     /// Every patched path is run through the sensitive guard before anything
