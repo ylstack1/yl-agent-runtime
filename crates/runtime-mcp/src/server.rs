@@ -38,7 +38,8 @@ use runtime_workspace::files::write::WriteOptions;
 use runtime_workspace::search::{FindOptions, SearchOptions};
 use crate::args::normalize_args;
 use crate::tools_fs::{
-    AllowedRootsArgs, DeleteArgs, EditArgs, FindFilesArgs, invalid, ListArgs,
+    AllowedRootsArgs, DeleteArgs, EditArgs, FindFilesArgs, GitBranchArgs, GitCommitArgs,
+    GitDiffArgs, GitLogArgs, GitRootArgs, GitStatusArgs, invalid, ListArgs,
     MkdirArgs, MoveArgs, output_json, PatchArgs, ProcessExecArgs,
     ProcessListArgs, ProcessReadArgs, ProcessStartArgs, ProcessStopArgs, ReadArgs, ReplaceTextArgs,
     resolve_project, SearchArgs, StatArgs, TreeArgs, TreeBudgetExceeded, walk_shallow, walk_tree,
@@ -146,6 +147,30 @@ impl McpServer {
                 )))
             }
         }
+    }
+
+    /// Resolve an optional project_id string to a ProjectId, defaulting to the
+    /// first (primary) root when not specified.
+    fn resolve_project_id(&self, project_id: &Option<String>) -> Result<ProjectId, McpError> {
+        match project_id {
+            Some(pid) => Uuid::parse_str(pid)
+                .map(|uuid| ProjectId(uuid))
+                .map_err(|e| invalid(format!("invalid project_id: {e}"))),
+            None => self
+                .roots
+                .first()
+                .map(|(id, _)| *id)
+                .ok_or_else(|| invalid("no workspace root configured")),
+        }
+    }
+
+    /// Return the filesystem root path for a given project_id.
+    fn root_for_project(&self, project_id: ProjectId) -> Result<PathBuf, McpError> {
+        self.roots
+            .iter()
+            .find(|(id, _)| *id == project_id)
+            .map(|(_, root)| root.clone())
+            .ok_or_else(|| invalid("project root not found"))
     }
 
     /// Map workspace/runtime errors to MCP errors: path/validation errors
@@ -367,7 +392,7 @@ impl McpServer {
                 "shell_builtins_available": false,
             },
             "runtime": {
-                "git_tools": false,
+                "git_tools": true,
                 "approval_gate": true,
                 "undo_journal": false,
             },
@@ -699,6 +724,284 @@ impl McpServer {
             "py", "go", "dotnet", "cmake", "ninja", "java", "javac",
         ];
         output_json(&json!({ "tools": tools }))
+    }
+
+    /// Find the git root of a workspace root.
+    #[tool(
+        name = "git.root",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string" }
+                    },
+                    "required": []
+                })
+            )
+            .expect("invalid git.root input schema")
+        )
+    )]
+    async fn git_root(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("git.root", &args.0)?;
+        let args: GitRootArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+        let project_id = self.resolve_project_id(&args.project_id)?;
+        let root = self.root_for_project(project_id)?;
+        let executor = ProcessExecutor::new();
+        let result = executor
+            .execute("git", &["rev-parse".to_string(), "--show-toplevel".to_string()], Some(&root), 30)
+            .map_err(Self::map_runtime_error)?;
+        output_json(&json!({
+            "exit_code": result.exit_code,
+            "stdout": result.stdout.trim_end(),
+            "stderr": result.stderr,
+            "success": result.success,
+        }))
+    }
+
+    /// Show the working tree status.
+    #[tool(
+        name = "git.status",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string" }
+                    },
+                    "required": []
+                })
+            )
+            .expect("invalid git.status input schema")
+        )
+    )]
+    async fn git_status(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("git.status", &args.0)?;
+        let args: GitStatusArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+        let project_id = self.resolve_project_id(&args.project_id)?;
+        let root = self.root_for_project(project_id)?;
+        let executor = ProcessExecutor::new();
+        let result = executor
+            .execute("git", &["status".to_string(), "--porcelain".to_string()], Some(&root), 30)
+            .map_err(Self::map_runtime_error)?;
+        output_json(&json!({
+            "exit_code": result.exit_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+        }))
+    }
+
+    /// Show changes between commits, commit and working tree, etc.
+    #[tool(
+        name = "git.diff",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string" },
+                        "path": { "type": "string" },
+                        "staged": { "type": "boolean" }
+                    },
+                    "required": []
+                })
+            )
+            .expect("invalid git.diff input schema")
+        )
+    )]
+    async fn git_diff(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("git.diff", &args.0)?;
+        let args: GitDiffArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+        let project_id = self.resolve_project_id(&args.project_id)?;
+        let root = self.root_for_project(project_id)?;
+        let mut cmd_args = vec!["diff".to_string()];
+        if args.staged.unwrap_or(false) {
+            cmd_args.push("--staged".to_string());
+        }
+        if let Some(path) = &args.path {
+            cmd_args.push("--".to_string());
+            cmd_args.push(path.clone());
+        }
+        let executor = ProcessExecutor::new();
+        let result = executor
+            .execute("git", &cmd_args, Some(&root), 30)
+            .map_err(Self::map_runtime_error)?;
+        output_json(&json!({
+            "exit_code": result.exit_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+        }))
+    }
+
+    /// Show commit logs.
+    #[tool(
+        name = "git.log",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string" },
+                        "max_count": { "type": "integer" },
+                        "path": { "type": "string" }
+                    },
+                    "required": []
+                })
+            )
+            .expect("invalid git.log input schema")
+        )
+    )]
+    async fn git_log(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("git.log", &args.0)?;
+        let args: GitLogArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+        let project_id = self.resolve_project_id(&args.project_id)?;
+        let root = self.root_for_project(project_id)?;
+        let mut cmd_args = vec![
+            "log".to_string(),
+            "--oneline".to_string(),
+        ];
+        if let Some(max_count) = args.max_count {
+            cmd_args.push("-n".to_string());
+            cmd_args.push(max_count.to_string());
+        }
+        if let Some(path) = &args.path {
+            cmd_args.push("--".to_string());
+            cmd_args.push(path.clone());
+        }
+        let executor = ProcessExecutor::new();
+        let result = executor
+            .execute("git", &cmd_args, Some(&root), 30)
+            .map_err(Self::map_runtime_error)?;
+        output_json(&json!({
+            "exit_code": result.exit_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "success": result.success,
+        }))
+    }
+
+    /// Show the current branch name.
+    #[tool(
+        name = "git.branch",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string" }
+                    },
+                    "required": []
+                })
+            )
+            .expect("invalid git.branch input schema")
+        )
+    )]
+    async fn git_branch(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("git.branch", &args.0)?;
+        let args: GitBranchArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+        let project_id = self.resolve_project_id(&args.project_id)?;
+        let root = self.root_for_project(project_id)?;
+        let executor = ProcessExecutor::new();
+        let result = executor
+            .execute("git", &["branch".to_string(), "--show-current".to_string()], Some(&root), 30)
+            .map_err(Self::map_runtime_error)?;
+        output_json(&json!({
+            "exit_code": result.exit_code,
+            "stdout": result.stdout.trim_end(),
+            "stderr": result.stderr,
+            "success": result.success,
+        }))
+    }
+
+    /// Stage specific files and commit them. `git add -A` / `--all` is blocked.
+    #[tool(
+        name = "git.commit",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string" },
+                        "message": { "type": "string" },
+                        "files": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["message"]
+                })
+            )
+            .expect("invalid git.commit input schema")
+        )
+    )]
+    async fn git_commit(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("git.commit", &args.0)?;
+        let args: GitCommitArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+
+        // Block `git add -A` / `--all` before the approval gate so invalid
+        // requests are rejected immediately without creating a pending
+        // approval.
+        if let Some(files) = &args.files {
+            for f in files {
+                if f == "-A" || f == "--all" {
+                    return Err(invalid(
+                        "git add -A/--all is blocked. Stage specific files instead."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Approval gate: git commit requires consent in restrictive profiles.
+        self.enforce_tool(Capability::GitCommit, None).await?;
+
+        let project_id = self.resolve_project_id(&args.project_id)?;
+        let root = self.root_for_project(project_id)?;
+        let executor = ProcessExecutor::new();
+
+        // Stage specific files.
+        if let Some(files) = &args.files {
+            let mut add_args = vec!["add".to_string()];
+            add_args.extend(files.iter().cloned());
+            let add_result = executor
+                .execute("git", &add_args, Some(&root), 30)
+                .map_err(Self::map_runtime_error)?;
+            if !add_result.success {
+                return output_json(&json!({
+                    "exit_code": add_result.exit_code,
+                    "stdout": add_result.stdout,
+                    "stderr": add_result.stderr,
+                    "error": "git add failed",
+                    "success": false,
+                }));
+            }
+        }
+
+        let commit_result = executor
+            .execute(
+                "git",
+                &["commit".to_string(), "-m".to_string(), args.message.clone()],
+                Some(&root),
+                30,
+            )
+            .map_err(Self::map_runtime_error)?;
+        output_json(&json!({
+            "exit_code": commit_result.exit_code,
+            "stdout": commit_result.stdout,
+            "stderr": commit_result.stderr,
+            "success": commit_result.success,
+        }))
     }
 
     /// Read a file's text content.
