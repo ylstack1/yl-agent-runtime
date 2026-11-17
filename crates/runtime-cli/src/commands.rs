@@ -276,6 +276,14 @@ fn strip_verbatim_prefix(path: &Path) -> PathBuf {
 ///    validation (DNS rebinding protection) and bind to TCP.
 /// 8. Default bind address is 127.0.0.1 (localhost only); pass
 ///    `--allow-remote` to bind 0.0.0.0.
+/// Discover the LAN address a remote client should dial, by asking the OS which
+/// local address it would use to reach the internet. No packets are sent.
+fn local_lan_ip() -> Option<std::net::IpAddr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    sock.local_addr().ok().map(|a| a.ip())
+}
+
 pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots: Vec<String>) -> Result<()> {
     // 1. Load config.
     let config = match std::env::var("YL_RUNTIME_CONFIG").ok() {
@@ -359,14 +367,24 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
 
-    let config = StreamableHttpServerConfig::default()
+    // DNS-rebinding protection: by default rmcp only accepts loopback `Host`
+    // headers and answers anything else with `403 Forbidden`. When we are bound
+    // to 0.0.0.0 (i.e. serving a LAN client such as the Android app), the client
+    // legitimately sends `Host: <lan-ip>:<port>`, so host validation must be off.
+    // A `--host` that is not loopback is treated the same way.
+    let host_is_loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    let accept_any_host = allow_remote || !host_is_loopback;
+
+    let mut config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false) // stateless for 2026-07-28
         .with_json_response(true)        // plain JSON replies (simpler than SSE)
-        .with_allowed_hosts(vec![
-            "localhost".to_string(),
-            "127.0.0.1".to_string(),
-            "::1".to_string(),
-        ]);
+        .disable_allowed_origins();      // clients may send any Origin
+
+    if accept_any_host {
+        config = config.disable_allowed_hosts();
+    } else {
+        config = config.with_allowed_hosts(["localhost", "127.0.0.1", "::1"]);
+    }
 
     let mcp_server_clone = mcp_server.clone();
     let mcp_service = StreamableHttpService::new(
@@ -378,17 +396,25 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
     // Build axum router with the MCP service mounted at /mcp.
     let app = Router::new().nest_service("/mcp", mcp_service);
 
-    // CORS + origin validation (spec-mandated for DNS rebinding protection).
-    // Allow any origin for local development; works with Android MCP clients
-    // that send specific Origin headers.
+    // Permissive CORS. The Android client is a native HTTP client and does not
+    // enforce CORS at all; this exists for browser-based MCP clients and for
+    // browser preflight requests. `AllowOrigin::any()` cannot be combined with
+    // credentials, which we do not use.
     let app = app.layer(
         CorsLayer::new()
-            .allow_methods([Method::POST, Method::OPTIONS])
+            .allow_methods([Method::POST, Method::GET, Method::DELETE, Method::OPTIONS])
             .allow_headers([
                 HeaderName::from_static("content-type"),
-                HeaderName::from_static("mcp-session-id"),
                 HeaderName::from_static("accept"),
+                HeaderName::from_static("authorization"),
+                HeaderName::from_static("mcp-session-id"),
+                HeaderName::from_static("mcp-protocol-version"),
+                HeaderName::from_static("last-event-id"),
                 HeaderName::from_static("origin"),
+            ])
+            .expose_headers([
+                HeaderName::from_static("mcp-session-id"),
+                HeaderName::from_static("mcp-protocol-version"),
             ])
             .allow_origin(AllowOrigin::any())
             .allow_credentials(false),
@@ -401,7 +427,12 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, roots:
     };
 
     info!("YL Agent Runtime MCP HTTP server listening on http://{}", addr);
-    info!("MCP endpoint: http://{}/mcp", addr);
+    info!("MCP endpoint (this machine): http://127.0.0.1:{}/mcp", port);
+    if accept_any_host {
+        if let Some(ip) = local_lan_ip() {
+            info!("MCP endpoint (LAN devices): http://{}:{}/mcp", ip, port);
+        }
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

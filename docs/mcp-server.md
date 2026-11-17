@@ -28,6 +28,44 @@ cargo run -p runtime-cli -- serve --root .
 ./target/debug/yl.exe serve --root . --config ./config/runtime.toml
 ```
 
+### Connecting from another device (phone / Android MCP client)
+
+1. Start the server bound to all interfaces:
+
+   ```powershell
+   ./target/debug/yl.exe serve --allow-remote --root .
+   ```
+
+2. Find the machine's LAN address:
+
+   ```powershell
+   Get-NetIPAddress -AddressFamily IPv4 |
+     Where-Object { $_.InterfaceAlias -notmatch 'Loopback' -and $_.IPAddress -notmatch '^169\.' } |
+     Select-Object IPAddress
+   ```
+
+3. Point the client at `http://<lan-ip>:8077/mcp` (for example
+   `http://192.168.1.130:8077/mcp`). Allow port `8077` through Windows
+   Firewall on **Private** networks:
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "YL Agent Runtime MCP" -Direction Inbound `
+     -Protocol TCP -LocalPort 8077 -Profile Private -Action Allow
+   ```
+
+**Why `--allow-remote` matters for `403 Forbidden`.** rmcp protects against DNS
+rebinding by checking the request's `Host` header against an allowlist that
+defaults to `localhost`, `127.0.0.1` and `::1`. A phone sends
+`Host: 192.168.1.130:8077`, which is not on that list, so the server answers
+`403 Forbidden` before the request ever reaches a tool. `--allow-remote` (or any
+non-loopback `--host`) therefore disables the host allowlist and the server
+accepts any `Host` value. Loopback-only mode keeps the strict default.
+
+> Security note: with `--allow-remote` anyone on the same network can call the
+> tools. Run it only on trusted networks, keep `--root` pointed at a project
+> directory, and remember the workspace layer still refuses paths outside the
+> configured roots and blocks sensitive files such as `.env`.
+
 ### Connect an MCP client
 
 #### Opencode (`opencode.json`)
@@ -98,7 +136,7 @@ For remote HTTP access:
 | `--config` | `./config/runtime.toml` | Path to config file |
 | `--host` | `127.0.0.1` | Bind address (HTTP server only) |
 | `--port` | `8077` | Bind port |
-| `--allow-remote` | false | Bind to `0.0.0.0` instead of localhost |
+| `--allow-remote` | false | Bind to `0.0.0.0` and accept any `Host` header (needed for LAN/phone clients) |
 
 ### Config file (`config/runtime.toml`)
 
@@ -219,7 +257,10 @@ Filesystem   Process
 | "Sensitive file blocked" | The file matches a secret pattern (`.env`, `*.pem`, etc.) |
 | "Absolute path not within allowed roots" | Use a relative path or add the directory as a root |
 | Connection refused | Server not running; start with `yl serve --root .` |
-| 403 Forbidden | Origin header mismatch; ensure client sends proper Origin header |
+| 403 Forbidden on a LAN/phone client | The `Host` allowlist blocks non-loopback names. Start with `--allow-remote` (or `--host 0.0.0.0`) |
+| 415 Unsupported Media Type | Send `Content-Type: application/json` and `Accept: application/json, text/event-stream` |
+| "Unknown argument 'X'" | The tool rejected the field; the error lists the valid argument names |
+| `tool not found` | Tool names are dotted (`workspace.read`), not underscored (`workspace_read`) |
 
 ## Files
 

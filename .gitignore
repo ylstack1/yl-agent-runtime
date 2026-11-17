@@ -8,6 +8,9 @@
 /cache/
 /logs/
 
+# Runtime artifacts (generated when the server runs)
+**/data/audit.jsonl
+
 # IDE
 .idea/
 .vscode/
