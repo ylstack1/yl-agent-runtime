@@ -228,7 +228,10 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
         Arc::new(runtime_policy::PolicyEngineImpl::new());
 
     // 4. Build the workspace service and register roots.
-    let service = Arc::new(WorkspaceServiceImpl::with_data_dir(config.data_dir.clone())?);
+    let service = Arc::new(WorkspaceServiceImpl::with_data_dir(
+        config.data_dir.clone(),
+        config.discovery.clone(),
+    )?);
     service.set_sensitive(SensitiveMatcher::new());
     let mut roots_pairs: Vec<(ProjectId, PathBuf)> = Vec::new();
     for root in roots {
@@ -386,7 +389,10 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, yolo: 
         Arc::new(runtime_policy::PolicyEngineImpl::new());
 
     // 4. Build the workspace service and register roots.
-    let service = Arc::new(WorkspaceServiceImpl::with_data_dir(config.data_dir.clone())?);
+    let service = Arc::new(WorkspaceServiceImpl::with_data_dir(
+        config.data_dir.clone(),
+        config.discovery.clone(),
+    )?);
     service.set_sensitive(SensitiveMatcher::new());
     let mut roots_pairs: Vec<(ProjectId, PathBuf)> = Vec::new();
     for root in roots {
@@ -670,7 +676,7 @@ pub async fn run_workspace(action: WorkspaceAction) -> Result<()> {
         .unwrap_or_else(|_| Config::default());
 
     let service =
-        WorkspaceServiceImpl::with_data_dir(config.data_dir.clone())?;
+        WorkspaceServiceImpl::with_data_dir(config.data_dir.clone(), config.discovery.clone())?;
 
     match action {
         WorkspaceAction::List => {

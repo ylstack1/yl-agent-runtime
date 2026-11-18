@@ -5,6 +5,7 @@
 # Project data and state directories (PRD section 16)
 /config/
 /data/
+/**/data/
 /state/
 /cache/
 /logs/

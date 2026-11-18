@@ -423,6 +423,25 @@ pub struct GitCommitArgs {
     pub files: Option<Vec<String>>,
 }
 
+/// Clone a Git repository into a discovery root. `url` may contain embedded
+/// credentials (`user:pass@host`); they are stripped before logging/audit but
+/// still passed to git. Destination must be inside an enabled discovery root
+/// with the `clone` flag.
+#[derive(Debug, Deserialize)]
+pub struct GitCloneArgs {
+    #[allow(dead_code)]
+    pub project_id: Option<String>,
+    pub url: String,
+    #[serde(alias = "root")]
+    pub root_id: String,
+    #[serde(alias = "dest", alias = "directory", alias = "path")]
+    pub dest: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub depth: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Tree walking
 // ---------------------------------------------------------------------------

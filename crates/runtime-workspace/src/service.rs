@@ -17,6 +17,7 @@ use crate::path_safety::{AccessMode, ContainedPath, PathValidator};
 use crate::search::{search_tree, find_files, FindOptions, FindReport, SearchOptions, SearchReport};
 use crate::sensitive::{SensitiveMatcher, SensitiveVerdict};
 use diffy::patch_set::{FileOperation, PatchSet, ParseOptions};
+use runtime_config::config::{DiscoveryConfig, DiscoveryRoot};
 use runtime_core::error::{Error, Result};
 use runtime_core::traits::WorkspaceService;
 use runtime_core::types::*;
@@ -82,6 +83,9 @@ pub struct WorkspaceServiceImpl {
     data_dir: Option<PathBuf>,
     /// Path to the workspace registry JSONL file.
     registry_path: Option<PathBuf>,
+    /// Discovery config (root enablement + per-op flags). Used to enforce
+    /// that register/create only happen on roots that allow it.
+    discovery: Arc<RwLock<DiscoveryConfig>>,
 }
 
 impl WorkspaceServiceImpl {
@@ -93,6 +97,7 @@ impl WorkspaceServiceImpl {
             sensitive: Arc::new(RwLock::new(SensitiveMatcher::new())),
             data_dir: None,
             registry_path: None,
+            discovery: Arc::new(RwLock::new(DiscoveryConfig::default())),
         }
     }
 
@@ -101,7 +106,14 @@ impl WorkspaceServiceImpl {
     /// Existing workspaces are loaded from `<data_dir>/workspaces.jsonl` if
     /// present; new registrations are appended and unregistrations rewrite
     /// the file.
-    pub fn with_data_dir(data_dir: PathBuf) -> Result<Self> {
+    ///
+    /// `discovery` supplies root enablement and per-operation flags
+    /// (create/register/import/clone) that are enforced by `register` and
+    /// `create_workspace`.
+    pub fn with_data_dir(
+        data_dir: PathBuf,
+        discovery: DiscoveryConfig,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&data_dir).map_err(|e| {
             Error::Config(format!("Cannot create data dir {data_dir:?}: {e}"))
         })?;
@@ -115,6 +127,7 @@ impl WorkspaceServiceImpl {
             sensitive: Arc::new(RwLock::new(SensitiveMatcher::new())),
             data_dir: Some(data_dir),
             registry_path: Some(registry_path.clone()),
+            discovery: Arc::new(RwLock::new(discovery)),
         };
 
         // Load persisted workspaces if the registry file exists.
@@ -167,6 +180,115 @@ impl WorkspaceServiceImpl {
         }
         writer.flush().map_err(Error::Io)?;
         Ok(())
+    }
+
+    /// Find the enabled discovery root that contains `path`, checking the
+    /// required per-operation flag (`register` or `create`). Returns the
+    /// root id and canonical root path. Used to enforce that workspace
+    /// registration/creation only happens on roots that explicitly allow it.
+    fn check_discovery_root(
+        &self,
+        path: &Path,
+        require_op: &str,
+    ) -> Result<(String, PathBuf)> {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let config = self.discovery.read().unwrap();
+
+        // If no discovery roots are configured, skip enforcement (backward
+        // compatible: roots are an opt-in security boundary).
+        if config.roots.is_empty() {
+            return Ok((String::new(), canonical));
+        }
+
+        let mut best: Option<(String, PathBuf, usize)> = None;
+        for root in &config.roots {
+            if !root.enabled {
+                continue;
+            }
+            let root_canonical = match root.path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if canonical.starts_with(&root_canonical) {
+                let len = root_canonical.as_os_str().len();
+                if best.as_ref().map_or(true, |(_, _, b)| len > *b) {
+                    best = Some((root.id.clone(), root_canonical, len));
+                }
+            }
+        }
+
+        let (root_id, _canonical, _len) = best.ok_or_else(|| {
+            Error::PermissionDenied(format!(
+                "Path {path:?} is not within any enabled discovery root"
+            ))
+        })?;
+
+        let root = config
+            .roots
+            .iter()
+            .find(|r| r.id == root_id)
+            .ok_or_else(|| Error::Config(format!("Discovery root {root_id} missing from config")))?;
+        match require_op {
+            "register" if !root.register => {
+                return Err(Error::PermissionDenied(format!(
+                    "Register not allowed on discovery root {root_id}"
+                )));
+            }
+            "create" if !root.create => {
+                return Err(Error::PermissionDenied(format!(
+                    "Create not allowed on discovery root {root_id}"
+                )));
+            }
+            _ => {}
+        }
+
+        Ok((root_id, path.canonicalize().unwrap_or_else(|_| path.to_path_buf())))
+    }
+
+    /// Validate that `dest_rel` is within an enabled discovery root that
+    /// allows cloning, and that the destination does not already exist.
+    /// Returns the canonical absolute destination path.
+    pub fn validate_clone_dest(&self, root_id: &str, dest_rel: &str) -> Result<PathBuf> {
+        let config = self.discovery.read().unwrap();
+        if config.roots.is_empty() {
+            return Err(Error::PermissionDenied(
+                "No discovery roots configured".to_string(),
+            ));
+        }
+        let root = config
+            .roots
+            .iter()
+            .find(|r| r.id == root_id && r.enabled && r.clone)
+            .ok_or_else(|| {
+                Error::PermissionDenied(format!(
+                    "Discovery root {root_id} not enabled for clone"
+                ))
+            })?;
+
+        let root_canonical = root
+            .path
+            .canonicalize()
+            .map_err(|e| Error::Validation(format!("Cannot canonicalize root {root_id}: {e}")))?;
+
+        let dest = root_canonical.join(dest_rel);
+        if dest.exists() {
+            return Err(Error::Validation(format!(
+                "Destination already exists: {dest:?}"
+            )));
+        }
+
+        let validator = PathValidator::new()
+            .with_root(root_canonical.clone())
+            .allow_symlinks(false);
+        let contained = validator
+            .validate_access(ProjectId::nil(), Path::new(dest_rel), AccessMode::Write)
+            .map_err(|e| {
+                Error::PathNotAllowed(format!(
+                    "Destination {dest_rel:?} is outside root {root_id}: {e}"
+                ))
+            })?;
+
+        Ok(clean_verbatim_prefix(&contained.absolute_path))
     }
 
     /// Clone of the configured sensitive matcher (consumed by Task 11 MCP tools).
@@ -249,6 +371,10 @@ impl WorkspaceService for WorkspaceServiceImpl {
                 root
             )));
         }
+
+        // Enforce discovery root `register` flag: only enabled roots that
+        // explicitly allow registration may be registered as workspaces.
+        self.check_discovery_root(&root, "register")?;
 
         let canonical = root.canonicalize().map_err(|e| {
             Error::Validation(format!("Cannot canonicalize workspace root: {}", e))
@@ -751,6 +877,10 @@ impl WorkspaceServiceImpl {
                 parent_path
             )));
         }
+
+        // Enforce discovery root `create` flag: only enabled roots that
+        // explicitly allow creation may have new workspaces created under them.
+        self.check_discovery_root(parent_path, "create")?;
 
         let dest = parent_path.join(name);
         if dest.exists() {
@@ -1678,8 +1808,11 @@ diff --git a/b.txt b/b.txt
 
         // First service instance: register a workspace.
         {
-            let service = WorkspaceServiceImpl::with_data_dir(data_dir.path().to_path_buf())
-                .unwrap();
+            let service = WorkspaceServiceImpl::with_data_dir(
+                data_dir.path().to_path_buf(),
+                DiscoveryConfig::default(),
+            )
+            .unwrap();
             let id = service
                 .register(root.path().to_path_buf(), ExecutionProfile::Development)
                 .await
@@ -1689,8 +1822,11 @@ diff --git a/b.txt b/b.txt
         }
 
         // Second service instance: should load the persisted workspace.
-        let service2 = WorkspaceServiceImpl::with_data_dir(data_dir.path().to_path_buf())
-            .unwrap();
+        let service2 = WorkspaceServiceImpl::with_data_dir(
+            data_dir.path().to_path_buf(),
+            DiscoveryConfig::default(),
+        )
+        .unwrap();
         let records = service2.list_workspaces();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].origin, WorkspaceOrigin::Registered);
@@ -1707,8 +1843,11 @@ diff --git a/b.txt b/b.txt
         let root = TempDir::new().unwrap();
 
         {
-            let service = WorkspaceServiceImpl::with_data_dir(data_dir.path().to_path_buf())
-                .unwrap();
+            let service = WorkspaceServiceImpl::with_data_dir(
+                data_dir.path().to_path_buf(),
+                DiscoveryConfig::default(),
+            )
+            .unwrap();
             let id = service
                 .register(root.path().to_path_buf(), ExecutionProfile::Development)
                 .await
@@ -1718,9 +1857,133 @@ diff --git a/b.txt b/b.txt
         }
 
         // After reload, still empty.
-        let service2 = WorkspaceServiceImpl::with_data_dir(data_dir.path().to_path_buf())
-            .unwrap();
+        let service2 = WorkspaceServiceImpl::with_data_dir(
+            data_dir.path().to_path_buf(),
+            DiscoveryConfig::default(),
+        )
+        .unwrap();
         assert!(service2.list_workspaces().is_empty());
         assert!(service2.get_workspace(ProjectId::nil()).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_disabled_root() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let config = DiscoveryConfig {
+            roots: vec![runtime_config::config::DiscoveryRoot {
+                id: "readonly".to_string(),
+                label: "Read-only".to_string(),
+                path: temp.path().to_path_buf(),
+                enabled: true,
+                browse: true,
+                create: true,
+                register: false, // registration not allowed
+                import: true,
+                clone: true,
+            }],
+            ..Default::default()
+        };
+        let service =
+            WorkspaceServiceImpl::with_data_dir(data_dir.path().to_path_buf(), config)
+                .unwrap();
+        let err = service
+            .register(temp.path().to_path_buf(), ExecutionProfile::Development)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Register not allowed"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_rejects_root_outside_discovery() {
+        let service = WorkspaceServiceImpl::with_data_dir(
+            TempDir::new().unwrap().path().to_path_buf(),
+            DiscoveryConfig {
+                roots: vec![runtime_config::config::DiscoveryRoot {
+                    id: "repo".to_string(),
+                    label: "Repo".to_string(),
+                    path: TempDir::new().unwrap().path().to_path_buf(),
+                    enabled: true,
+                    browse: true,
+                    create: true,
+                    register: true,
+                    import: true,
+                    clone: true,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let outside = TempDir::new().unwrap();
+        let err = service
+            .register(outside.path().to_path_buf(), ExecutionProfile::Development)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not within any enabled discovery root"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_rejects_root_without_create_flag() {
+        let parent = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let config = DiscoveryConfig {
+            roots: vec![runtime_config::config::DiscoveryRoot {
+                id: "nocreate".to_string(),
+                label: "No Create".to_string(),
+                path: parent.path().to_path_buf(),
+                enabled: true,
+                browse: true,
+                create: false, // creation not allowed
+                register: true,
+                import: true,
+                clone: true,
+            }],
+            ..Default::default()
+        };
+        let service =
+            WorkspaceServiceImpl::with_data_dir(data_dir.path().to_path_buf(), config)
+                .unwrap();
+        let err = service
+            .create_workspace(parent.path(), "new-project", ExecutionProfile::Development, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Create not allowed"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_allowed_when_root_flags_enabled() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let config = DiscoveryConfig {
+            roots: vec![runtime_config::config::DiscoveryRoot {
+                id: "repo".to_string(),
+                label: "Repo".to_string(),
+                path: temp.path().to_path_buf(),
+                enabled: true,
+                browse: true,
+                create: true,
+                register: true,
+                import: true,
+                clone: true,
+            }],
+            ..Default::default()
+        };
+        let service =
+            WorkspaceServiceImpl::with_data_dir(data_dir.path().to_path_buf(), config)
+                .unwrap();
+        let id = service
+            .register(temp.path().to_path_buf(), ExecutionProfile::Development)
+            .await
+            .unwrap();
+        assert!(service.list_workspaces().iter().any(|r| r.id == id));
     }
 }
