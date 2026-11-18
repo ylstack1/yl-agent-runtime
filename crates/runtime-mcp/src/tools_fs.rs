@@ -74,6 +74,18 @@ pub struct ReadArgs {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ReadManyArgs {
+    #[serde(alias = "files", alias = "file_paths", alias = "filePaths")]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub line_start: Option<u64>,
+    #[serde(default)]
+    pub line_end: Option<u64>,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct WriteArgs {
     pub path: String,
     pub content: String,
@@ -176,6 +188,9 @@ pub struct SearchArgs {
     #[serde(default = "default_search_max_results")]
     #[allow(dead_code)]
     pub max_results: usize,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub offset: usize,
     #[serde(default)]
     #[allow(dead_code)]
     pub is_regex: bool,
@@ -330,6 +345,16 @@ pub struct ProcessStopArgs {
     pub process_id: String,
     #[allow(dead_code)]
     pub force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProcessInteractArgs {
+    #[serde(alias = "id", alias = "pid")]
+    pub process_id: String,
+    #[serde(alias = "input", alias = "text", alias = "stdin")]
+    pub data: String,
+    #[serde(default, alias = "close", alias = "eof")]
+    pub close_stdin: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

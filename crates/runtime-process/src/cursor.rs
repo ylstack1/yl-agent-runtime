@@ -248,6 +248,12 @@ impl Default for CursorLog {
     }
 }
 
+impl std::fmt::Debug for CursorLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CursorLog").finish_non_exhaustive()
+    }
+}
+
 /// Process registry with cursor logs and garbage collection.
 ///
 /// Tracks one [`CursorLog`] per process id. Exited processes are garbage

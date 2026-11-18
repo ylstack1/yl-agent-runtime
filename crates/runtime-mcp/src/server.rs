@@ -41,10 +41,10 @@ use crate::args::normalize_args;
 use crate::tools_fs::{
     AllowedRootsArgs, DeleteArgs, EditArgs, FindFilesArgs, GitBranchArgs, GitCommitArgs,
     GitDiffArgs, GitLogArgs, GitRootArgs, GitStatusArgs, invalid, ListArgs,
-    MkdirArgs, MoveArgs, output_json, PatchArgs, ProcessExecArgs,
-    ProcessListArgs, ProcessReadArgs, ProcessStartArgs, ProcessStopArgs, ReadArgs, ReplaceTextArgs,
-    resolve_project, SearchArgs, StatArgs, TreeArgs, TreeBudgetExceeded, walk_shallow, walk_tree,
-    WriteArgs,
+    MkdirArgs, MoveArgs, output_json, PatchArgs, ProcessExecArgs, ProcessInteractArgs,
+    ProcessListArgs, ProcessReadArgs, ProcessStartArgs, ProcessStopArgs, ReadArgs, ReadManyArgs,
+    ReplaceTextArgs, resolve_project, SearchArgs, StatArgs, TreeArgs, TreeBudgetExceeded,
+    walk_shallow, walk_tree, WriteArgs,
 };
 use chrono::Utc;
 use serde_json::json;
@@ -191,6 +191,25 @@ impl McpServer {
             Error::Io(e) => invalid(format!("IO error: {e}")),
             other => McpError::internal_error(other.to_string(), None),
         }
+    }
+}
+
+/// Render a read outcome as the JSON shape returned by `workspace.read` and
+/// each entry of `workspace.read_many`.
+fn read_outcome_json(outcome: ReadOutcome) -> serde_json::Value {
+    match outcome {
+        ReadOutcome::Text(t) => json!({
+            "content": t.content,
+            "truncated": t.truncated,
+            "size": t.size,
+            "returned_bytes": t.returned_bytes,
+        }),
+        ReadOutcome::Media(m) => json!({
+            "mime": m.mime,
+            "base64": m.base64,
+            "size": m.size,
+        }),
+        ReadOutcome::Binary { size } => json!({ "binary": true, "size": size }),
     }
 }
 
@@ -381,10 +400,12 @@ impl McpServer {
         output_json(&json!({
             "filesystem": {
                 "read": true,
+                "read_many": true,
                 "write": true,
                 "edit": true,
                 "patch": true,
                 "search": true,
+                "search_pagination": true,
                 "line_numbered_read": true,
                 "root_contained": true,
                 "sensitive_files_blocked": true,
@@ -392,6 +413,7 @@ impl McpServer {
             "process": {
                 "exec": true,
                 "long_running": true,
+                "stdin": true,
                 "cursor_paged_output": true,
                 "executable_allowlist": runtime_process::ALLOWED_TOOLS,
                 "shell_builtins_available": false,
@@ -399,7 +421,7 @@ impl McpServer {
             "runtime": {
                 "git_tools": true,
                 "approval_gate": true,
-                "undo_journal": false,
+                "undo_journal": true,
             },
             "limits": {
                 "workspace_roots": self.roots.len(),
@@ -578,9 +600,9 @@ impl McpServer {
                     "type": "object",
                     "properties": {
                         "process_id": { "type": "string" },
-                        "after": { "type": "integer" },
-                        "limit_bytes": { "type": "integer" },
-                        "wait_ms": { "type": "integer" }
+                        "after": { "type": "integer", "description": "Last seq already seen (0 = from the start)" },
+                        "limit_bytes": { "type": "integer", "description": "Page size in bytes (default 64000)" },
+                        "wait_ms": { "type": "integer", "description": "Block up to this long for new output" }
                     },
                     "required": ["process_id"]
                 })
@@ -598,18 +620,101 @@ impl McpServer {
             .map_err(|e| invalid(format!("invalid process_id: {e}")))?;
         let process_id = ProcessId(process_id);
 
-        let output = self
+        let after = args.after.unwrap_or(0);
+        let limit_bytes = args.limit_bytes.unwrap_or(64_000).max(1) as usize;
+        let wait_ms = args.wait_ms.unwrap_or(0);
+
+        let page = self
             .process_service
-            .output(process_id)
+            .read_output(process_id, after, limit_bytes, wait_ms)
             .await
             .map_err(Self::map_runtime_error)?;
 
+        let status = self.process_service.status(process_id).await.ok();
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut chunks = Vec::new();
+        for chunk in &page.chunks {
+            match chunk.stream {
+                runtime_process::StreamId::Stdout => stdout.push_str(&chunk.text),
+                runtime_process::StreamId::Stderr => stderr.push_str(&chunk.text),
+            }
+            chunks.push(json!({
+                "seq": chunk.seq,
+                "stream": match chunk.stream {
+                    runtime_process::StreamId::Stdout => "stdout",
+                    runtime_process::StreamId::Stderr => "stderr",
+                },
+                "text": chunk.text,
+                "at": chunk.at.to_rfc3339(),
+            }));
+        }
+
         output_json(&json!({
             "process_id": args.process_id,
-            "stdout": String::from_utf8_lossy(&output.stdout),
-            "stderr": String::from_utf8_lossy(&output.stderr),
-            "exit_status": output.exit_status,
-            "truncated": output.truncated,
+            "chunks": chunks,
+            "stdout": stdout,
+            "stderr": stderr,
+            "next_after": page.next_after,
+            "oldest_sequence": page.oldest_sequence,
+            "cursor_lost": page.cursor_lost,
+            "truncated": page.truncated,
+            "running": status.as_ref().map(|s| s.running),
+            "exit_code": status
+                .and_then(|s| s.exit_status)
+                .and_then(|s| s.code),
+        }))
+    }
+
+    /// Write to a running process's stdin (session-style interaction).
+    #[tool(
+        name = "process.interact",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "process_id": { "type": "string" },
+                        "data": { "type": "string", "description": "Bytes to write to stdin" },
+                        "close_stdin": { "type": "boolean", "description": "Close stdin after writing (EOF)" }
+                    },
+                    "required": ["process_id", "data"]
+                })
+            )
+            .expect("invalid process.interact input schema")
+        )
+    )]
+    async fn process_interact(
+        &self,
+        args: Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("process.interact", &args.0)?;
+        let args: ProcessInteractArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+
+        let process_id = Uuid::parse_str(&args.process_id)
+            .map_err(|e| invalid(format!("invalid process_id: {e}")))?;
+        let process_id = ProcessId(process_id);
+        let close = args.close_stdin.unwrap_or(false);
+
+        self.process_service
+            .write_stdin(process_id, &args.data, close)
+            .await
+            .map_err(Self::map_runtime_error)?;
+
+        self.record_audit(
+            AuditEventType::ProcessWriteStdin,
+            None,
+            Some(args.process_id.clone()),
+        )
+        .await;
+
+        output_json(&json!({
+            "process_id": args.process_id,
+            "written": args.data.len(),
+            "stdin_closed": close,
         }))
     }
 
@@ -1059,6 +1164,85 @@ impl McpServer {
         self.read_impl("workspace.read_file", args.0).await
     }
 
+    /// Read several files in one call. Per-file failures are isolated so one
+    /// missing path does not lose the rest of the batch.
+    #[tool(
+        name = "workspace.read_many",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "paths": { "type": "array", "items": { "type": "string" } },
+                        "line_start": { "type": "integer" },
+                        "line_end": { "type": "integer" },
+                        "max_bytes": { "type": "integer" }
+                    },
+                    "required": ["paths"]
+                })
+            )
+            .expect("invalid workspace.read_many input schema")
+        )
+    )]
+    async fn workspace_read_many(
+        &self,
+        args: Parameters<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        const MAX_BATCH_READ: usize = 100;
+        let args = normalize_args("workspace.read_many", &args.0)?;
+        let args: ReadManyArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+
+        if args.paths.is_empty() {
+            return Err(invalid("workspace.read_many: 'paths' must contain at least one path"));
+        }
+        if args.paths.len() > MAX_BATCH_READ {
+            return Err(invalid(format!(
+                "workspace.read_many: at most {MAX_BATCH_READ} paths per call, got {}",
+                args.paths.len()
+            )));
+        }
+
+        let opts = ReadOptions {
+            line_start: args.line_start,
+            line_end: args.line_end,
+            max_bytes: args.max_bytes,
+            line_numbers: true,
+            ..Default::default()
+        };
+
+        let mut files: Vec<serde_json::Value> = Vec::new();
+        let mut errors: Vec<serde_json::Value> = Vec::new();
+        for requested in &args.paths {
+            let (project_id, path) = match self.resolve_user_path(&PathBuf::from(requested)) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    errors.push(json!({ "path": requested, "error": err.message }));
+                    continue;
+                }
+            };
+            match self.fs.read_text(project_id, &path, &opts).await {
+                Ok(outcome) => {
+                    let mut value = read_outcome_json(outcome);
+                    value["path"] = json!(requested);
+                    files.push(value);
+                }
+                Err(err) => errors.push(json!({
+                    "path": requested,
+                    "error": Self::map_runtime_error(err).message,
+                })),
+            }
+        }
+
+        output_json(&json!({
+            "files": files,
+            "errors": errors,
+            "read": files.len(),
+            "failed": errors.len(),
+        }))
+    }
+
     async fn read_impl(&self, tool: &str, args: JsonObject) -> Result<CallToolResult, McpError> {
         let args = normalize_args(tool, &args)?;
         let args: ReadArgs =
@@ -1082,18 +1266,7 @@ impl McpServer {
             .await
             .map_err(Self::map_runtime_error)?
         {
-            ReadOutcome::Text(t) => output_json(&json!({
-                "content": t.content,
-                "truncated": t.truncated,
-                "size": t.size,
-                "returned_bytes": t.returned_bytes,
-            })),
-            ReadOutcome::Media(m) => output_json(&json!({
-                "mime": m.mime,
-                "base64": m.base64,
-                "size": m.size,
-            })),
-            ReadOutcome::Binary { size } => output_json(&json!({ "binary": true, "size": size })),
+            outcome => output_json(&read_outcome_json(outcome)),
         }
     }
 
@@ -1424,6 +1597,7 @@ impl McpServer {
             serde_json::from_value(serde_json::Value::Object(args))
                 .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
         let (project_id, _) = self.resolve_user_path(&PathBuf::new())?;
+        let offset = args.offset;
         let opts = SearchOptions {
             query: args.query,
             is_regex: args.is_regex,
@@ -1432,6 +1606,7 @@ impl McpServer {
             exclude: args.exclude,
             context: args.context,
             max_results: args.max_results.min(5_000),
+            offset,
             files_only: false,
             include_hidden: false,
             include_ignored: false,
@@ -1443,9 +1618,10 @@ impl McpServer {
             .search(project_id, None, &opts)
             .await
             .map_err(Self::map_runtime_error)?;
+        let returned = report.matches.len();
         let matches: Vec<serde_json::Value> = report
             .matches
-            .into_iter()
+            .iter()
             .map(|m| {
                 json!({
                     "path": m.file,
@@ -1457,8 +1633,15 @@ impl McpServer {
                 })
             })
             .collect();
+        let has_more = report.truncated;
         output_json(&json!({
             "matches": matches,
+            "returned": returned,
+            "offset": report.offset,
+            "next_offset": if has_more { Some(offset + returned) } else { None },
+            "has_more": has_more,
+            "total_matches": report.total_matches,
+            "total_exact": !has_more,
             "files_matched": report.files_matched,
             "files_scanned": report.files_scanned,
             "skipped_binary": report.skipped_binary,
@@ -2239,6 +2422,10 @@ mod tests {
     }
 
     async fn fixture() -> (McpServer, TempDir, Arc<AuditServiceImpl>) {
+        fixture_with(false).await
+    }
+
+    async fn fixture_with(yolo: bool) -> (McpServer, TempDir, Arc<AuditServiceImpl>) {
         let dir = TempDir::new().expect("temp dir");
         std::fs::write(dir.path().join("a.txt"), b"hello world\n").expect("write fixture");
         let fs = Arc::new(WorkspaceServiceImpl::new());
@@ -2264,7 +2451,7 @@ mod tests {
             policy_engine,
             approval_broker,
             undo_journal,
-            false,
+            yolo,
         ).await;
         (server, dir, audit)
     }
@@ -2652,5 +2839,223 @@ mod tests {
             "unexpected message: {}",
             err.message
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Batch read
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_many_returns_each_file_and_isolates_errors() {
+        let (server, dir, _audit) = fixture().await;
+        std::fs::write(dir.path().join("b.txt"), b"second\n").expect("write b");
+
+        let result = server
+            .workspace_read_many(Parameters(obj(json!({
+                "paths": ["a.txt", "b.txt", "missing.txt"]
+            }))))
+            .await
+            .expect("read_many");
+        let value: serde_json::Value =
+            serde_json::from_str(&content_text(&result)).expect("json");
+
+        let files = value["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 2, "two readable files expected: {value}");
+        assert!(files
+            .iter()
+            .any(|f| f["path"] == "a.txt" && f["content"].as_str().unwrap_or("").contains("hello")));
+        assert!(files
+            .iter()
+            .any(|f| f["path"] == "b.txt" && f["content"].as_str().unwrap_or("").contains("second")));
+
+        let errors = value["errors"].as_array().expect("errors array");
+        assert_eq!(errors.len(), 1, "one isolated error expected: {value}");
+        assert!(errors[0]["path"] == "missing.txt");
+        assert_eq!(value["read"].as_u64(), Some(2));
+        assert_eq!(value["failed"].as_u64(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn read_many_applies_line_range_to_every_file() {
+        let (server, dir, _audit) = fixture().await;
+        std::fs::write(dir.path().join("b.txt"), b"l1\nl2\nl3\n").expect("write b");
+
+        let result = server
+            .workspace_read_many(Parameters(obj(json!({
+                "paths": ["b.txt"],
+                "line_start": 2,
+                "line_end": 3
+            }))))
+            .await
+            .expect("read_many");
+        let value: serde_json::Value =
+            serde_json::from_str(&content_text(&result)).expect("json");
+        let content = value["files"][0]["content"].as_str().expect("content");
+        assert!(content.contains("l2"), "content: {content}");
+        assert!(!content.contains("l1"), "content: {content}");
+    }
+
+    // ------------------------------------------------------------------
+    // Search pagination
+    // ------------------------------------------------------------------
+
+    async fn seed_needles(server: &McpServer, dir: &TempDir) {
+        std::fs::write(
+            dir.path().join("b.txt"),
+            b"needle one\nneedle two\n",
+        )
+        .expect("write b");
+        std::fs::write(
+            dir.path().join("c.txt"),
+            b"needle three\nneedle four\n",
+        )
+        .expect("write c");
+        let _ = server;
+    }
+
+    #[tokio::test]
+    async fn search_reports_total_and_pages_by_offset() {
+        let (server, dir, _audit) = fixture().await;
+        seed_needles(&server, &dir).await;
+
+        let first = server
+            .workspace_search(Parameters(obj(json!({
+                "query": "needle", "max_results": 2
+            }))))
+            .await
+            .expect("first page");
+        let first: serde_json::Value =
+            serde_json::from_str(&content_text(&first)).expect("json");
+        assert_eq!(first["matches"].as_array().map(|m| m.len()), Some(2));
+        assert_eq!(first["returned"].as_u64(), Some(2));
+        assert_eq!(first["has_more"].as_bool(), Some(true));
+        assert_eq!(first["next_offset"].as_u64(), Some(2));
+        assert_eq!(first["total_exact"].as_bool(), Some(false));
+
+        let second = server
+            .workspace_search(Parameters(obj(json!({
+                "query": "needle", "max_results": 2, "offset": 2
+            }))))
+            .await
+            .expect("second page");
+        let second: serde_json::Value =
+            serde_json::from_str(&content_text(&second)).expect("json");
+        assert_eq!(second["matches"].as_array().map(|m| m.len()), Some(2));
+        assert_eq!(second["offset"].as_u64(), Some(2));
+
+        let all = server
+            .workspace_search(Parameters(obj(json!({
+                "query": "needle", "max_results": 100
+            }))))
+            .await
+            .expect("all matches");
+        let all: serde_json::Value =
+            serde_json::from_str(&content_text(&all)).expect("json");
+        assert_eq!(all["total_matches"].as_u64(), Some(4));
+        assert_eq!(all["total_exact"].as_bool(), Some(true));
+        assert_eq!(all["has_more"].as_bool(), Some(false));
+    }
+
+    // ------------------------------------------------------------------
+    // Long-running process I/O
+    // ------------------------------------------------------------------
+
+    async fn start_process(server: &McpServer, program: &str, args: &[&str]) -> String {
+        let result = server
+            .process_start(Parameters(obj(json!({
+                "project_id": "00000000-0000-0000-0000-000000000000",
+                "program": program,
+                "args": args
+            }))))
+            .await
+            .expect("process.start");
+        let value: serde_json::Value =
+            serde_json::from_str(&content_text(&result)).expect("json");
+        value["process_id"].as_str().expect("process_id").to_string()
+    }
+
+    async fn read_until(server: &McpServer, id: &str, needle: &str) -> serde_json::Value {
+        for _ in 0..60 {
+            let result = server
+                .process_read(Parameters(obj(json!({
+                    "process_id": id,
+                    "after": 0,
+                    "limit_bytes": 65536
+                }))))
+                .await
+                .expect("process.read");
+            let value: serde_json::Value =
+                serde_json::from_str(&content_text(&result)).expect("json");
+            let text = format!(
+                "{}{}",
+                value["stdout"].as_str().unwrap_or(""),
+                value["stderr"].as_str().unwrap_or("")
+            );
+            if text.contains(needle) {
+                return value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("output {needle:?} never appeared for process {id}");
+    }
+
+    #[tokio::test]
+    async fn process_read_returns_captured_output_with_cursor() {
+        let (server, _dir, _audit) = fixture_with(true).await;
+        let id = start_process(&server, "git", &["--version"]).await;
+
+        let page = read_until(&server, &id, "git version").await;
+        assert!(
+            page["stdout"].as_str().unwrap_or("").to_lowercase().contains("git version"),
+            "page: {page}"
+        );
+        let cursor = page["next_after"].as_u64().expect("next_after");
+        assert!(cursor >= 1);
+
+        // Reading again past the cursor yields no new chunks.
+        let again = server
+            .process_read(Parameters(obj(json!({
+                "process_id": id, "after": cursor
+            }))))
+            .await
+            .expect("second read");
+        let again: serde_json::Value =
+            serde_json::from_str(&content_text(&again)).expect("json");
+        assert_eq!(again["chunks"].as_array().map(|c| c.len()), Some(0));
+        assert_eq!(again["next_after"].as_u64(), Some(cursor));
+    }
+
+    #[tokio::test]
+    async fn process_interact_feeds_stdin() {
+        let (server, _dir, _audit) = fixture_with(true).await;
+        let code = "process.stdin.once('data', d => { process.stdout.write('echo:' + d.toString().trim()); process.exit(0); })";
+        let id = start_process(&server, "node", &["-e", code]).await;
+
+        let result = server
+            .process_interact(Parameters(obj(json!({
+                "process_id": id,
+                "data": "hello\n"
+            }))))
+            .await
+            .expect("process.interact");
+        assert!(content_text(&result).contains("\"written\":6"), "{}", content_text(&result));
+
+        let page = read_until(&server, &id, "echo:hello").await;
+        assert!(
+            page["stdout"].as_str().unwrap_or("").contains("echo:hello"),
+            "page: {page}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capabilities_reports_undo_journal_and_new_tools_honestly() {
+        let (server, _dir, _audit) = fixture().await;
+        let result = server.runtime_capabilities().await.expect("capabilities");
+        let value: serde_json::Value =
+            serde_json::from_str(&content_text(&result)).expect("json");
+        assert_eq!(value["runtime"]["undo_journal"].as_bool(), Some(true));
+        assert_eq!(value["process"]["stdin"].as_bool(), Some(true));
+        assert_eq!(value["filesystem"]["read_many"].as_bool(), Some(true));
+        assert_eq!(value["filesystem"]["search_pagination"].as_bool(), Some(true));
     }
 }

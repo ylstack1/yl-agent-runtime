@@ -63,6 +63,10 @@ pub struct SearchOptions {
     pub context: u32, // 0..=5, clamped
     #[serde(default = "default_max_results")]
     pub max_results: usize, // 200 default; hard-capped at 5000
+    /// Zero-based match offset: skip this many matches before collecting the
+    /// page. Paired with `max_results` for cursor-free pagination.
+    #[serde(default)]
+    pub offset: usize,
     #[serde(default)]
     pub files_only: bool,
     #[serde(default)]
@@ -85,6 +89,7 @@ impl std::fmt::Debug for SearchOptions {
             .field("exclude", &self.exclude)
             .field("context", &self.context)
             .field("max_results", &self.max_results)
+            .field("offset", &self.offset)
             .field("files_only", &self.files_only)
             .field("include_hidden", &self.include_hidden)
             .field("include_ignored", &self.include_ignored)
@@ -112,7 +117,13 @@ pub struct SearchReport {
     pub skipped_binary: u64,
     pub skipped_too_large: u64,
     pub skipped_inaccessible: u64,
+    /// More matches exist beyond `offset + max_results`.
     pub truncated: bool,
+    /// Zero-based offset this page started at.
+    pub offset: usize,
+    /// Matches encountered by the scan. Exact when `truncated` is false;
+    /// otherwise a lower bound, because the scan stopped early.
+    pub total_matches: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +175,10 @@ pub fn search_tree(root: &Path, opts: &SearchOptions) -> Result<SearchReport> {
 
     let include_set = build_glob_set(&opts.include)?;
     let overrides = build_overrides(root, opts)?;
-    let max_results = opts.max_results.min(MAX_RESULTS_CAP);
+    let offset = opts.offset;
+    // Scan far enough to fill the page plus one extra match, so `truncated`
+    // tells the caller whether another page exists.
+    let cap = opts.max_results.min(MAX_RESULTS_CAP).saturating_add(offset);
     let context = opts.context.min(MAX_CONTEXT) as usize;
 
     let mut walker = WalkBuilder::new(root);
@@ -263,7 +277,7 @@ pub fn search_tree(root: &Path, opts: &SearchOptions) -> Result<SearchReport> {
             let Some(captures) = regex.captures(line) else { continue };
             let Some(m) = captures.get(0) else { continue };
             found += 1;
-            if found <= max_results as u64 {
+            if found > offset as u64 && found <= cap as u64 {
                 file_matches.push(SearchMatch {
                     file: path.to_path_buf(),
                     line: (index + 1) as u64,
@@ -278,7 +292,7 @@ pub fn search_tree(root: &Path, opts: &SearchOptions) -> Result<SearchReport> {
         if file_matches.is_empty() {
             // No collectable matches in this file. If we already ran past the
             // cap, there are more matches elsewhere: stop early.
-            if found > max_results as u64 {
+            if found > cap as u64 {
                 truncated = true;
                 break 'walk;
             }
@@ -301,7 +315,7 @@ pub fn search_tree(root: &Path, opts: &SearchOptions) -> Result<SearchReport> {
         matches.extend(emitted);
 
         // More matches exist than we can collect: stop early.
-        if found > max_results as u64 {
+        if found > cap as u64 {
             truncated = true;
             break 'walk;
         }
@@ -315,6 +329,8 @@ pub fn search_tree(root: &Path, opts: &SearchOptions) -> Result<SearchReport> {
         skipped_too_large,
         skipped_inaccessible,
         truncated,
+        offset,
+        total_matches: found,
     })
 }
 
@@ -492,6 +508,7 @@ mod tests {
             exclude: Vec::new(),
             context: 0,
             max_results: DEFAULT_MAX_RESULTS,
+            offset: 0,
             files_only: false,
             include_hidden: false,
             include_ignored: false,

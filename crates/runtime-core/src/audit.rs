@@ -178,6 +178,8 @@ pub enum AuditEventType {
     ProcessWait,
     ProcessTerminate,
     ProcessList,
+    /// Bytes written to a running process's stdin.
+    ProcessWriteStdin,
 
     /// Terminal operations
     TerminalOpen,

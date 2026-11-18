@@ -43,8 +43,22 @@
 7. **Educational error messages** — Wrap path/policy errors with causes + fixes list
 8. **`get_recent_tool_calls`** — Query `data/audit.jsonl` with limit + preview truncation
 
+## Scope Ruling (operator: "do best u recommend")
+
+Implemented the four highest-value items, not all twelve:
+
+| # | Item | Status | Notes |
+|---|------|--------|-------|
+| 1 | Session-based process I/O (`process.interact` + cursor-paged `process.read`) | Done | piped stdin/stdout/stderr, `CursorLog`, exit watcher, `write_stdin` |
+| 2 | `read_multiple_files` → `workspace.read_many` | Done | 100-path cap, per-file error isolation |
+| 6 | Search pagination → `workspace.search` offset + total/has_more | Done | `total_exact` honesty flag |
+| 28 | Honest `runtime.capabilities` flags | Done | `read_many`, `search_pagination`, `stdin`, `undo_journal` |
+
+Deferred (not this pass): fuzzy edit (#3), blocked commands (#4), dynamic config (#5), tool-call history (#7), usage stats (#8), educational error messages (#10), binary formats (#12).
+
 ## Verification
 
 - `cargo check --workspace` gate clean (standard excludes)
-- `cargo test` all passing
-- Real MCP testing against live server on port 8077
+- `cargo test --workspace` all passing except the two pre-existing unrelated failures (`backend-native::test_native_backend_capabilities_honest`, `runtime-toolchain::test_detect_source`)
+- Real MCP testing against live server on port 8077 via `@modelcontextprotocol/sdk` StreamableHTTP client: 27/27 checks pass (read_many, search pagination, process I/O + stdin, approval gate, `git add -A` blocked pre-gate, capabilities honesty)
+

@@ -51,6 +51,15 @@ pub const ALIASES: &[(&str, &[(&str, &str)])] = &[
     ("workspace.move", &[("src", "source"), ("from", "source"), ("dest", "destination"), ("dst", "destination"), ("to", "destination")]),
     ("workspace.delete", &[("path", "paths"), ("files", "paths")]),
     ("workspace.read", &[("start", "line_start"), ("end", "line_end")]),
+    (
+        "workspace.read_many",
+        &[
+            ("files", "paths"),
+            ("paths_to_read", "paths"),
+            ("start", "line_start"),
+            ("end", "line_end"),
+        ],
+    ),
     ("workspace.stat", &[("file", "path"), ("target", "path")]),
     (
         "process.start",
@@ -79,6 +88,18 @@ pub const ALIASES: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     ("process.stop", &[("id", "process_id"), ("pid", "process_id"), ("kill", "force")]),
+    (
+        "process.interact",
+        &[
+            ("id", "process_id"),
+            ("pid", "process_id"),
+            ("input", "data"),
+            ("text", "data"),
+            ("stdin", "data"),
+            ("close", "close_stdin"),
+            ("eof", "close_stdin"),
+        ],
+    ),
     ("process.list", &[]),
     ("process.discover_tools", &[]),
 ];
@@ -86,6 +107,7 @@ pub const ALIASES: &[(&str, &[(&str, &str)])] = &[
 /// Required arguments per tool (PRD §13.1 names are canonical).
 pub const REQUIRED: &[(&str, &[&str])] = &[
     ("workspace.read", &["path"]),
+    ("workspace.read_many", &["paths"]),
     ("workspace.write", &["path", "content"]),
     ("workspace.edit", &["path"]),
     ("workspace.patch", &["diff"]),
@@ -100,6 +122,7 @@ pub const REQUIRED: &[(&str, &[&str])] = &[
     ("process.exec", &["project_id", "command"]),
     ("process.start", &["project_id", "program"]),
     ("process.read", &["process_id"]),
+    ("process.interact", &["process_id", "data"]),
     ("process.stop", &["process_id"]),
     ("process.list", &[]),
     ("process.discover_tools", &[]),
@@ -128,6 +151,7 @@ const KNOWN: &[(&str, &[&str])] = &[
         "workspace.read_file",
         &["path", "line_start", "line_end", "offset", "max_bytes", "media", "head", "tail", "want_sha256"],
     ),
+    ("workspace.read_many", &["paths", "line_start", "line_end", "max_bytes"]),
     ("workspace.write", &["path", "content", "overwrite", "append"]),
     ("workspace.edit", &["path", "edits", "old_text", "new_text", "expected_occurrences", "dry_run"]),
     ("workspace.patch", &["diff", "dry_run"]),
@@ -140,6 +164,7 @@ const KNOWN: &[(&str, &[&str])] = &[
         &[
             "query",
             "max_results",
+            "offset",
             "is_regex",
             "case_sensitive",
             "include",
@@ -158,6 +183,7 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("process.exec", &["project_id", "command", "args", "timeout_seconds"]),
     ("process.start", &["project_id", "program", "args", "cwd", "timeout_seconds"]),
     ("process.read", &["process_id", "after", "limit_bytes", "wait_ms"]),
+    ("process.interact", &["process_id", "data", "close_stdin"]),
     ("process.stop", &["process_id", "force"]),
     ("process.list", &["project_id"]),
     ("process.discover_tools", &[]),

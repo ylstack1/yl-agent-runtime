@@ -35,3 +35,5 @@ Thumbs.db
 # Tauri
 apps/desktop-tauri/target/
 apps/desktop-tauri/src-tauri/target/
+# Superpowers execution scratch (ledger, review packages)
+.superpowers/
