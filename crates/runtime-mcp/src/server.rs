@@ -1988,6 +1988,78 @@ impl McpServer {
         }))
     }
 
+    /// Register an existing directory as a workspace. Requires approval via
+    /// the `WorkspaceRegister` capability gate; on `Ask`, returns an
+    /// `approval_id` to approve and retry.
+    #[tool(
+        name = "workspace.register",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "profile": { "type": "string", "description": "execution profile (development, inspect); default development" }
+                    },
+                    "required": ["path"]
+                })
+            )
+            .expect("invalid workspace.register input schema")
+        )
+    )]
+    async fn workspace_register(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("workspace.register", &args.0)?;
+        let path_str: String = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| invalid("workspace.register requires a `path` argument"))?;
+        let profile_str: String = args
+            .get("profile")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "development".to_string());
+        let profile = match profile_str.as_str() {
+            "inspect" => ExecutionProfile::Inspect,
+            _ => ExecutionProfile::Development,
+        };
+
+        let path = PathBuf::from(&path_str);
+        if !path.exists() {
+            return Err(invalid(format!(
+                "workspace.register: path does not exist: {path_str}"
+            )));
+        }
+        if !path.is_dir() {
+            return Err(invalid(format!(
+                "workspace.register: path is not a directory: {path_str}"
+            )));
+        }
+
+        // Approval gate: registering a workspace requires consent.
+        self.enforce_tool(Capability::WorkspaceRegister, Some(&path_str))
+            .await?;
+
+        let id = self
+            .fs
+            .register(path, profile)
+            .await
+            .map_err(Self::map_runtime_error)?;
+
+        self.record_audit(
+            AuditEventType::WorkspaceRegister,
+            Some(id),
+            Some(path_str.clone()),
+        )
+        .await;
+
+        output_json(&json!({
+            "id": id,
+            "path": path_str,
+            "profile": profile_str,
+        }))
+    }
+
     /// Request approval for a capability+resource. Returns an `approval_id`
     /// that can be used with `approval.approve` or `yl approval approve`.
     #[tool(

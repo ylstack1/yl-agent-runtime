@@ -78,6 +78,9 @@ enum Commands {
     /// Discovery roots: list, browse, detect projects under authorized roots.
     #[command(subcommand)]
     Discovery(DiscoveryAction),
+    /// Workspace registry: list, register, unregister, create workspaces.
+    #[command(subcommand)]
+    Workspace(WorkspaceAction),
     /// Manage approval requests (approve/reject/list pending approvals)
     Approval {
         #[command(subcommand)]
@@ -87,7 +90,7 @@ enum Commands {
 
 mod commands;
 
-use commands::{ApprovalAction, DiscoveryAction};
+use commands::{ApprovalAction, DiscoveryAction, WorkspaceAction};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -155,6 +158,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Discovery(action) => {
             commands::run_discovery(action).await?;
+        }
+        Commands::Workspace(action) => {
+            commands::run_workspace(action).await?;
         }
         Commands::Approval { action } => {
             commands::run_approval(action).await?;

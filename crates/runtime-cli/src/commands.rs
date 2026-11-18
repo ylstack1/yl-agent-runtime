@@ -228,7 +228,7 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
         Arc::new(runtime_policy::PolicyEngineImpl::new());
 
     // 4. Build the workspace service and register roots.
-    let service = Arc::new(WorkspaceServiceImpl::new());
+    let service = Arc::new(WorkspaceServiceImpl::with_data_dir(config.data_dir.clone())?);
     service.set_sensitive(SensitiveMatcher::new());
     let mut roots_pairs: Vec<(ProjectId, PathBuf)> = Vec::new();
     for root in roots {
@@ -386,7 +386,7 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, yolo: 
         Arc::new(runtime_policy::PolicyEngineImpl::new());
 
     // 4. Build the workspace service and register roots.
-    let service = Arc::new(WorkspaceServiceImpl::new());
+    let service = Arc::new(WorkspaceServiceImpl::with_data_dir(config.data_dir.clone())?);
     service.set_sensitive(SensitiveMatcher::new());
     let mut roots_pairs: Vec<(ProjectId, PathBuf)> = Vec::new();
     for root in roots {
@@ -638,6 +638,83 @@ pub enum DiscoveryAction {
     Enable { root: String },
     /// Disable a discovery root.
     Disable { root: String },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum WorkspaceAction {
+    /// List registered workspaces.
+    List,
+    /// Register an existing directory as a workspace.
+    Register {
+        path: String,
+    },
+    /// Unregister a workspace by ID (does not delete project files).
+    Unregister {
+        id: String,
+    },
+    /// Create a new empty project directory under a parent path and register it.
+    Create {
+        #[arg(help = "Parent directory under which to create the project")]
+        parent: String,
+        #[arg(help = "Name of the new project directory")]
+        name: String,
+    },
+}
+
+/// Workspace registry commands: list, register, unregister, create.
+///
+/// Backed by `WorkspaceServiceImpl` — the same service a future desktop
+/// controller GUI would call, keeping CLI and GUI consistent.
+pub async fn run_workspace(action: WorkspaceAction) -> Result<()> {
+    let config = Config::load_from_file(&PathBuf::from("./config/runtime.toml"))
+        .unwrap_or_else(|_| Config::default());
+
+    let service =
+        WorkspaceServiceImpl::with_data_dir(config.data_dir.clone())?;
+
+    match action {
+        WorkspaceAction::List => {
+            let records = service.list_workspaces();
+            if records.is_empty() {
+                println!("No workspaces registered.");
+                return Ok(());
+            }
+            println!("Registered workspaces:");
+            for rec in records {
+                println!(
+                    "  {} | {} | origin={:?} | profile={:?} | root={}",
+                    rec.id,
+                    rec.display_name,
+                    rec.origin,
+                    rec.profile,
+                    rec.root.display()
+                );
+            }
+        }
+        WorkspaceAction::Register { path } => {
+            let root = PathBuf::from(&path);
+            let id = service.register(root, ExecutionProfile::Development).await?;
+            println!("Registered workspace {} at {}", id, path);
+        }
+        WorkspaceAction::Unregister { id } => {
+            let project_id =
+                uuid::Uuid::parse_str(&id).map_err(|e| anyhow::anyhow!("invalid workspace id: {e}"))?;
+            service.unregister(ProjectId(project_id)).await?;
+            println!("Unregistered workspace {}", id);
+        }
+        WorkspaceAction::Create { parent, name } => {
+            let id = service
+                .create_workspace(
+                    Path::new(&parent),
+                    &name,
+                    ExecutionProfile::Development,
+                    &[],
+                )
+                .await?;
+            println!("Created workspace {} at {}/{}", id, parent, name);
+        }
+    }
+    Ok(())
 }
 
 /// Discovery root commands: list, browse, detect, enable, disable.

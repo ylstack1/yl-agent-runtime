@@ -61,6 +61,7 @@ pub const ALIASES: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     ("workspace.stat", &[("file", "path"), ("target", "path")]),
+    ("workspace.register", &[("directory", "path"), ("dir", "path")]),
     (
         "process.start",
         &[
@@ -116,6 +117,7 @@ pub const REQUIRED: &[(&str, &[&str])] = &[
     ("workspace.find_files", &["pattern"]),
     ("workspace.tree", &["path"]),
     ("workspace.mkdir", &["path"]),
+    ("workspace.register", &["path"]),
     ("workspace.move", &["source", "destination"]),
     ("workspace.delete", &["paths"]),
     ("workspace.stat", &["path"]),
@@ -177,6 +179,7 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("workspace.tree", &["path", "depth", "exclude_patterns"]),
     ("workspace.stat", &["path"]),
     ("workspace.mkdir", &["path"]),
+    ("workspace.register", &["path"]),
     ("workspace.move", &["source", "destination"]),
     ("workspace.delete", &["paths", "recursive"]),
     ("workspace.allowed_roots", &[]),
