@@ -75,6 +75,9 @@ enum Commands {
         #[arg(long = "root")]
         roots: Vec<String>,
     },
+    /// Discovery roots: list, browse, detect projects under authorized roots.
+    #[command(subcommand)]
+    Discovery(DiscoveryAction),
     /// Manage approval requests (approve/reject/list pending approvals)
     Approval {
         #[command(subcommand)]
@@ -84,7 +87,7 @@ enum Commands {
 
 mod commands;
 
-use commands::ApprovalAction;
+use commands::{ApprovalAction, DiscoveryAction};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -149,6 +152,9 @@ async fn main() -> anyhow::Result<()> {
             roots,
         } => {
             commands::run_http_server(host, port, allow_remote, yolo, roots).await?;
+        }
+        Commands::Discovery(action) => {
+            commands::run_discovery(action).await?;
         }
         Commands::Approval { action } => {
             commands::run_approval(action).await?;

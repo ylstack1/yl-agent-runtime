@@ -21,6 +21,7 @@ pub struct Config {
     pub transport: TransportConfig,
     pub remote: RemoteConfig,
     #[serde(default)] pub workspace: WorkspaceConfig,
+    #[serde(default)] pub discovery: DiscoveryConfig,
 }
 
 /// Daemon configuration
@@ -120,6 +121,119 @@ impl Default for WorkspaceConfig {
     }
 }
 
+/// Entry kind returned by discovery browsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryEntryKind {
+    File,
+    Directory,
+}
+
+/// One entry discovered under a root during browsing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryBrowseEntry {
+    pub name: String,
+    pub relative_path: PathBuf,
+    pub entry_kind: DiscoveryEntryKind,
+    pub size: u64,
+    pub modified_time: Option<String>,
+    pub hidden: bool,
+}
+
+/// Result of a paginated browse under a discovery root.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryBrowseResult {
+    pub root_id: String,
+    pub path: String, // root-relative path that was browsed
+    pub entries: Vec<DiscoveryBrowseEntry>,
+    pub cursor: Option<String>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+/// Result of bounded project detection under a discovery root.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryProjectDetection {
+    pub root_id: String,
+    pub relative_path: String,
+    pub markers: Vec<String>,
+    pub project_types: Vec<String>,
+    pub git_present: bool,
+    pub git_branch: Option<String>,
+    pub confidence: f32,
+    pub scan_limits_hit: bool,
+}
+
+/// One configured discovery root: a user-authorized filesystem boundary from
+/// which browsing and destination selection are allowed. It is not
+/// automatically a workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryRoot {
+    pub id: String,
+    pub label: String,
+    pub path: PathBuf,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub browse: bool,
+    #[serde(default = "default_true")]
+    pub create: bool,
+    #[serde(default = "default_true")]
+    pub register: bool,
+    #[serde(default = "default_true")]
+    pub import: bool,
+    #[serde(default = "default_true")]
+    pub clone: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Discovery configuration: configurable roots and browsing limits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub default_root_id: Option<String>,
+    #[serde(default = "default_false")]
+    pub show_hidden: bool,
+    #[serde(default = "default_false")]
+    pub follow_symlinks: bool,
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
+    #[serde(default = "default_max_entries_per_page")]
+    pub max_entries_per_page: usize,
+    #[serde(default)]
+    pub roots: Vec<DiscoveryRoot>,
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_max_depth() -> usize {
+    12
+}
+
+fn default_max_entries_per_page() -> usize {
+    250
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_root_id: None,
+            show_hidden: false,
+            follow_symlinks: false,
+            max_depth: 12,
+            max_entries_per_page: 250,
+            roots: Vec::new(),
+        }
+    }
+}
+
 impl Config {
     pub fn default() -> Self {
         Self {
@@ -179,6 +293,7 @@ impl Config {
                 max_request_size_mb: 10,
             },
             workspace: WorkspaceConfig::default(),
+            discovery: DiscoveryConfig::default(),
         }
     }
 
@@ -323,5 +438,35 @@ max_request_size_mb = 10
         assert!(config.workspace.roots.is_empty());
         assert!(config.workspace.read_only_roots.is_empty());
         assert_eq!(config.workspace.max_file_size, 10_485_760);
+    }
+
+    #[test]
+    fn discovery_section_parses() {
+        let content = format!(
+            "{}\n\n[discovery]\nenabled = true\ndefault_root_id = \"developments\"\nshow_hidden = false\nfollow_symlinks = false\nmax_depth = 12\nmax_entries_per_page = 250\n\n[[discovery.roots]]\nid = \"developments\"\nlabel = \"Developments\"\npath = \"E:/ylstack-space/Developments\"\nenabled = true\nbrowse = true\ncreate = true\nregister = true\nimport = true\nclone = true\n",
+            base_toml()
+        );
+        let config: Config = toml::from_str(&content).unwrap();
+        assert!(config.discovery.enabled);
+        assert_eq!(
+            config.discovery.default_root_id.as_deref(),
+            Some("developments")
+        );
+        assert_eq!(config.discovery.roots.len(), 1);
+        let root = &config.discovery.roots[0];
+        assert_eq!(root.id, "developments");
+        assert_eq!(root.label, "Developments");
+        assert_eq!(root.path, PathBuf::from("E:/ylstack-space/Developments"));
+        assert!(root.enabled);
+        assert!(root.browse);
+        assert!(root.clone);
+    }
+
+    #[test]
+    fn discovery_defaults_when_section_absent() {
+        let config: Config = toml::from_str(&base_toml()).unwrap();
+        assert!(config.discovery.enabled);
+        assert!(config.discovery.roots.is_empty());
+        assert_eq!(config.discovery.max_entries_per_page, 250);
     }
 }

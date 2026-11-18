@@ -13,7 +13,10 @@ use runtime_process::{ProcessService, ProcessServiceOps};
 use runtime_policy::PolicyEngineImpl;
 use runtime_toolchain::ToolchainDiscovery;
 use runtime_undo::UndoJournal;
-use runtime_workspace::{SensitiveMatcher, WorkspaceService, WorkspaceServiceImpl};
+use runtime_workspace::{
+    discovery::DiscoveryService, SensitiveMatcher, WorkspaceService, WorkspaceServiceImpl,
+};
+use runtime_config::config::DiscoveryEntryKind;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -609,4 +612,110 @@ pub enum ApprovalAction {
     },
     /// List pending (not-yet-decided) approvals
     List,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum DiscoveryAction {
+    /// List configured discovery roots with their enablement and flags.
+    Roots,
+    /// Browse entries under a discovery root (root-relative path).
+    Browse {
+        root: String,
+        #[arg(default_value = "")]
+        path: String,
+        #[arg(long, short)]
+        cursor: Option<usize>,
+        #[arg(long, short, default_value = "50")]
+        limit: usize,
+    },
+    /// Detect project type for a directory under a discovery root.
+    Detect {
+        root: String,
+        #[arg(default_value = "")]
+        path: String,
+    },
+    /// Enable a discovery root.
+    Enable { root: String },
+    /// Disable a discovery root.
+    Disable { root: String },
+}
+
+/// Discovery root commands: list, browse, detect, enable, disable.
+///
+/// Backed by `DiscoveryService` in `runtime-workspace` — the same service a
+/// future desktop controller GUI would call, keeping CLI and GUI consistent.
+pub async fn run_discovery(action: DiscoveryAction) -> Result<()> {
+    let config = Config::load_from_file(&PathBuf::from("./config/runtime.toml"))
+        .unwrap_or_else(|_| Config::default());
+
+    let service = DiscoveryService::from_config(config.discovery)?;
+
+    match action {
+        DiscoveryAction::Roots => {
+            if service.list_roots().is_empty() {
+                println!("No discovery roots configured.");
+                return Ok(());
+            }
+            println!("Discovery roots:");
+            for root in service.list_roots() {
+                println!(
+                    "  {} | {} | enabled={} browse={} create={} register={} import={} clone={}",
+                    root.id,
+                    root.label,
+                    root.enabled,
+                    root.browse,
+                    root.create,
+                    root.register,
+                    root.import,
+                    root.clone,
+                );
+            }
+        }
+        DiscoveryAction::Browse {
+            root,
+            path,
+            cursor,
+            limit,
+        } => {
+            let result = service.browse_root(&root, &path, cursor, Some(limit))?;
+            println!("root={} path={}", result.root_id, result.path);
+            println!(
+                "cursor={:?} next_cursor={:?} has_more={}",
+                result.cursor, result.next_cursor, result.has_more
+            );
+            for entry in result.entries {
+                let kind = match entry.entry_kind {
+                    DiscoveryEntryKind::Directory => "dir",
+                    DiscoveryEntryKind::File => "file",
+                };
+                println!(
+                    "  {} {} {}B {}",
+                    kind,
+                    entry.name,
+                    entry.size,
+                    if entry.hidden { "(hidden)" } else { "" }
+                );
+            }
+        }
+        DiscoveryAction::Detect { root, path } => {
+            let det = service.detect_project(&root, &path)?;
+            println!("root={} path={}", det.root_id, det.relative_path);
+            println!("project_types={:?}", det.project_types);
+            println!("git_present={} git_branch={:?}", det.git_present, det.git_branch);
+            println!("confidence={:.2}", det.confidence);
+            println!("markers={:?}", det.markers);
+            if det.scan_limits_hit {
+                println!("scan_limits_hit=true");
+            }
+        }
+        DiscoveryAction::Enable { root } => {
+            service.set_root_enabled(&root, true)?;
+            println!("root {} enabled", root);
+        }
+        DiscoveryAction::Disable { root } => {
+            service.set_root_enabled(&root, false)?;
+            println!("root {} disabled", root);
+        }
+    }
+    Ok(())
 }
