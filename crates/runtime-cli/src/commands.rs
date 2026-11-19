@@ -705,8 +705,19 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, yolo: 
         config.policy.yolo,
     ).await);
 
-    // 6b. Build the identity service (pairing, sessions, device auth).
-    let identity: Arc<IdentityServiceImpl> = Arc::new(IdentityServiceImpl::new());
+    // 6b. Build the identity service (pairing, sessions, device auth). The
+    // JSONL log keeps paired devices and live sessions across restarts.
+    let identity: Arc<IdentityServiceImpl> = Arc::new(
+        IdentityServiceImpl::new().with_log_path(config.data_dir.join("identity.jsonl")),
+    );
+    match identity.load_persisted().await {
+        Ok(applied) if applied > 0 => info!(
+            "identity: restored {applied} persisted event(s) from {}",
+            config.data_dir.join("identity.jsonl").display()
+        ),
+        Ok(_) => {}
+        Err(e) => warn!("identity: cannot replay persisted state ({e}); starting empty"),
+    }
     let pairing_required = config.remote.pairing_required;
     let rate_limit_per_minute = config.remote.rate_limit_per_minute;
     if pairing_required {

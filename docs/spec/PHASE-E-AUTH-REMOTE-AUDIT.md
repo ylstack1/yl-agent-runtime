@@ -6,7 +6,7 @@
 
 ## Status
 
-**Phase E: implemented and verified live (E.1–E.4).** Sections 1–7 are the pre-implementation audit and requirement map; §8 is the as-built record with the evidence actually observed. The remaining Phase E gap is TLS certificate provisioning, which is documented as a hard prerequisite for non-loopback deployment (§8.6).
+**Phase E: implemented and verified live (E.1–E.4), plus durable identity state (§8.7).** Sections 1–7 are the pre-implementation audit and requirement map; §8 is the as-built record with the evidence actually observed. The remaining Phase E gap is TLS certificate provisioning, which is documented as a hard prerequisite for non-loopback deployment (§8.6).
 
 ## 1. Build / test baseline (current branch)
 
@@ -160,9 +160,36 @@ Traffic on the LAN is still plaintext HTTP. The bearer token and pairing signatu
 2. **In-process TLS** via `axum-server` + `rustls` with a host-provided certificate
 3. Loopback-only deployment (current dev default) — no LAN exposure at all
 
-Also deferred and still open: JSONL persistence for pairings/sessions (an in-memory store means every server restart forgets paired devices), and binding authorization policy to a specific workspace or device (today an authenticated device can reach every tool the runtime advertises).
+Also deferred and still open: binding authorization policy to a specific workspace or device (today an authenticated device can reach every tool the runtime advertises).
 
-## 8.7 Verification commands
+## 8.7 Persistence (`data_dir/identity.jsonl`)
+
+Pairings, devices and sessions are appended to a JSONL log as tagged events:
+`pairing`, `device`, `session`, `session_revoked`. `IdentityServiceImpl::with_log_path(..)`
+sets the file, and `load_persisted()` replays it at startup (wired into `run_http_server`).
+
+Replay is deliberately conservative:
+
+- a session is only restored while it is still active and unexpired, so a restart cannot revive yesterday's token
+- a pending pairing past its TTL is loaded as `expired` rather than resurrected
+- a revoked device stays revoked, and its pre-restart tokens still fail with `401`
+- an unparseable line is logged and skipped instead of blocking startup
+- a failed append never fails the pairing or session that triggered it (it is logged)
+
+Observed evidence, `C:\Users\SawYeLin\AppData\Local\Temp\opencode\persist-verify.ps1` — 9/9 across three server starts:
+```
+PASS  paired and authenticated                 device=bf3f57bb-...
+PASS  token works before restart               status=200
+PASS  same token works after restart           status=200
+PASS  device still registered after restart    listed
+PASS  approved pairing still recorded          approved
+PASS  revoked token rejected before restart    status=401
+PASS  revoked token still rejected after restart status=401 ... is revoked
+PASS  device still marked revoked after restart  revoked
+PASS  identity.jsonl written                   5 events
+```
+
+## 8.8 Verification commands
 
 ```
 cargo check --workspace --exclude backend-linux --exclude backend-macos --exclude runtime-terminal --exclude backend-windows

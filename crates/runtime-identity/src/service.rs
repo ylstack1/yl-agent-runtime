@@ -4,6 +4,8 @@ use runtime_core::error::{Error, Result};
 use runtime_core::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -94,15 +96,150 @@ pub struct IdentityServiceImpl {
     devices: Arc<RwLock<HashMap<DeviceId, DeviceInfo>>>,
     pairings: Arc<RwLock<HashMap<String, PairingRequest>>>,
     sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
+    /// Append-only JSONL log. When set, pairings, devices and sessions
+    /// survive a restart instead of forgetting every paired phone.
+    log_path: Option<PathBuf>,
+}
+
+/// One durable identity change, appended to the JSONL log. Replaying the log
+/// in order reconstructs the in-memory maps; later events win.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum IdentityEvent {
+    Pairing {
+        pairing_code: String,
+        request: PairingRequest,
+    },
+    Device {
+        device: DeviceInfo,
+    },
+    Session {
+        token: String,
+        session: SessionInfo,
+    },
+    SessionRevoked {
+        token: String,
+    },
 }
 
 impl IdentityServiceImpl {
     pub fn new() -> Self {
-        Self {
-            agents: Arc::new(RwLock::new(HashMap::new())),
-            devices: Arc::new(RwLock::new(HashMap::new())),
-            pairings: Arc::new(RwLock::new(HashMap::new())),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+        Self::default()
+    }
+
+    /// Persist identity state to a JSONL log so a restart keeps paired
+    /// devices and live sessions. Call `load_persisted` afterwards to replay
+    /// whatever is already on disk.
+    pub fn with_log_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.log_path = Some(path.into());
+        self
+    }
+
+    pub fn log_path(&self) -> Option<&Path> {
+        self.log_path.as_deref()
+    }
+
+    /// Replay the JSONL log into memory. Returns the number of events applied.
+    ///
+    /// Dead state is deliberately not resurrected: expired sessions and expired
+    /// pending pairings are skipped, and an unparseable line is reported and
+    /// skipped rather than prevented from starting the runtime.
+    pub async fn load_persisted(&self) -> Result<usize> {
+        let Some(path) = self.log_path.clone() else {
+            return Ok(0);
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(Error::Io(e)),
+        };
+
+        let now = chrono::Utc::now();
+        let mut applied = 0usize;
+
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let event: IdentityEvent = match serde_json::from_str(line) {
+                Ok(event) => event,
+                Err(e) => {
+                    tracing::warn!(
+                        "identity log {}:{}: skipping unreadable event ({e})",
+                        path.display(),
+                        index + 1
+                    );
+                    continue;
+                }
+            };
+
+            match event {
+                IdentityEvent::Pairing {
+                    pairing_code,
+                    mut request,
+                } => {
+                    if request.state == PairingState::Pending && request.expires_at < now {
+                        request.state = PairingState::Expired;
+                    }
+                    self.pairings.write().await.insert(pairing_code, request);
+                }
+                IdentityEvent::Device { device } => {
+                    self.devices.write().await.insert(device.id, device);
+                }
+                IdentityEvent::Session { token, session } => {
+                    // Only restore sessions that could still authenticate.
+                    if session.is_active && session.expires_at > now {
+                        self.sessions.write().await.insert(token, session);
+                    }
+                }
+                IdentityEvent::SessionRevoked { token } => {
+                    if let Some(session) = self.sessions.write().await.get_mut(&token) {
+                        session.is_active = false;
+                    }
+                }
+            }
+            applied += 1;
+        }
+
+        tracing::info!(
+            "identity: replayed {applied} persisted event(s) from {}",
+            path.display()
+        );
+        Ok(applied)
+    }
+
+    /// Append one event. Persistence is best-effort: a log failure must never
+    /// break a pairing or a session, but it is reported so it can be noticed.
+    fn append_event(&self, event: &IdentityEvent) {
+        let Some(path) = self.log_path.as_ref() else {
+            return;
+        };
+        let line = match serde_json::to_string(event) {
+            Ok(line) => line,
+            Err(e) => {
+                tracing::warn!("identity: cannot serialize event ({e})");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!("identity: cannot create {} ({e})", parent.display());
+                    return;
+                }
+            }
+        }
+        let result = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| {
+                file.write_all(line.as_bytes())?;
+                file.write_all(b"\n")
+            });
+        if let Err(e) = result {
+            tracing::warn!("identity: cannot append to {} ({e})", path.display());
         }
     }
 
@@ -153,7 +290,8 @@ impl IdentityService for IdentityServiceImpl {
             is_active: true,
             is_revoked: false,
         };
-        self.devices.write().await.insert(id, device);
+        self.devices.write().await.insert(id, device.clone());
+        self.append_event(&IdentityEvent::Device { device });
         Ok(id)
     }
 
@@ -168,11 +306,20 @@ impl IdentityService for IdentityServiceImpl {
     }
 
     async fn revoke_device(&self, id: DeviceId) -> Result<()> {
-        let mut devices = self.devices.write().await;
-        match devices.get_mut(&id) {
+        let revoked = {
+            let mut devices = self.devices.write().await;
+            match devices.get_mut(&id) {
+                Some(device) => {
+                    device.is_revoked = true;
+                    device.is_active = false;
+                    Some(device.clone())
+                }
+                None => None,
+            }
+        };
+        match revoked {
             Some(device) => {
-                device.is_revoked = true;
-                device.is_active = false;
+                self.append_event(&IdentityEvent::Device { device });
                 Ok(())
             }
             None => Err(Error::DeviceNotFound(format!("Device {}", id))),
@@ -200,7 +347,11 @@ impl IdentityService for IdentityServiceImpl {
             expires_at,
             device_id: None,
         };
-        self.pairings.write().await.insert(code, request.clone());
+        self.pairings.write().await.insert(code.clone(), request.clone());
+        self.append_event(&IdentityEvent::Pairing {
+            pairing_code: code,
+            request: request.clone(),
+        });
         Ok(request)
     }
 
@@ -233,29 +384,49 @@ impl IdentityService for IdentityServiceImpl {
         let device_id = self.register_device(device_name, device_public_key).await?;
 
         // Mark pairing as approved
-        let mut pairings = self.pairings.write().await;
-        if let Some(req) = pairings.get_mut(&pairing_code) {
-            req.state = PairingState::Approved;
-            req.device_id = Some(device_id);
+        let approved = {
+            let mut pairings = self.pairings.write().await;
+            match pairings.get_mut(&pairing_code) {
+                Some(req) => {
+                    req.state = PairingState::Approved;
+                    req.device_id = Some(device_id);
+                    Some(req.clone())
+                }
+                None => None,
+            }
+        };
+        if let Some(request) = approved {
+            self.append_event(&IdentityEvent::Pairing {
+                pairing_code,
+                request,
+            });
         }
 
         Ok(device_id)
     }
 
     async fn reject_pairing(&self, pairing_code: String) -> Result<()> {
-        let mut pairings = self.pairings.write().await;
-        let request = pairings
-            .get_mut(&pairing_code)
-            .ok_or_else(|| Error::Validation(format!("Pairing code not found: {pairing_code}")))?;
+        let rejected = {
+            let mut pairings = self.pairings.write().await;
+            let request = pairings
+                .get_mut(&pairing_code)
+                .ok_or_else(|| Error::Validation(format!("Pairing code not found: {pairing_code}")))?;
 
-        if request.state != PairingState::Pending {
-            return Err(Error::Validation(format!(
-                "Pairing code {pairing_code} is already {:?}",
-                request.state
-            )));
-        }
+            if request.state != PairingState::Pending {
+                return Err(Error::Validation(format!(
+                    "Pairing code {pairing_code} is already {:?}",
+                    request.state
+                )));
+            }
 
-        request.state = PairingState::Rejected;
+            request.state = PairingState::Rejected;
+            request.clone()
+        };
+
+        self.append_event(&IdentityEvent::Pairing {
+            pairing_code,
+            request: rejected,
+        });
         Ok(())
     }
 
@@ -320,7 +491,14 @@ impl IdentityService for IdentityServiceImpl {
             is_active: true,
         };
 
-        self.sessions.write().await.insert(token.clone(), session);
+        self.sessions
+            .write()
+            .await
+            .insert(token.clone(), session.clone());
+        self.append_event(&IdentityEvent::Session {
+            token: token.clone(),
+            session,
+        });
 
         Ok(token)
     }
@@ -362,14 +540,23 @@ impl IdentityService for IdentityServiceImpl {
 
     /// Revoke a session token.
     async fn revoke_session(&self, session_token: String) -> Result<()> {
-        let mut sessions = self.sessions.write().await;
-        match sessions.get_mut(&session_token) {
-            Some(session) => {
-                session.is_active = false;
-                Ok(())
+        let revoked = {
+            let mut sessions = self.sessions.write().await;
+            match sessions.get_mut(&session_token) {
+                Some(session) => {
+                    session.is_active = false;
+                    true
+                }
+                None => false,
             }
-            None => Err(Error::Validation("Invalid session token".to_string())),
+        };
+        if !revoked {
+            return Err(Error::Validation("Invalid session token".to_string()));
         }
+        self.append_event(&IdentityEvent::SessionRevoked {
+            token: session_token,
+        });
+        Ok(())
     }
 }
 
@@ -589,6 +776,154 @@ mod tests {
         service.revoke_device(device_id).await.unwrap();
         let err = service.validate_session(token).await.unwrap_err();
         assert!(err.to_string().contains("revoked"));
+    }
+
+    // ---- Persistence ----
+
+    fn temp_log_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "yl-identity-{tag}-{}-{nanos}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    fn sign_device_id(signing_key: &SigningKey, device_id: DeviceId) -> String {
+        signing_key
+            .sign(device_id.to_string().as_bytes())
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Pair a fresh device and return the key (to re-sign later), its id, and
+    /// a live session token.
+    async fn pair_and_authenticate(
+        service: &IdentityServiceImpl,
+    ) -> (SigningKey, DeviceId, String) {
+        let mut key_bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut key_bytes);
+        let signing_key = SigningKey::from_bytes(&key_bytes);
+        let verifying_key: ed25519_dalek::VerifyingKey = (&signing_key).into();
+
+        let request = service
+            .request_pairing(
+                "persisted-device".to_string(),
+                verifying_key.as_bytes().to_vec(),
+            )
+            .await
+            .unwrap();
+        let device_id = service
+            .approve_pairing(request.pairing_code)
+            .await
+            .unwrap();
+        let token = service
+            .authenticate_device(device_id, sign_device_id(&signing_key, device_id))
+            .await
+            .unwrap();
+        (signing_key, device_id, token)
+    }
+
+    #[tokio::test]
+    async fn test_pairing_device_and_session_survive_restart() {
+        let path = temp_log_path("restart");
+
+        let first = IdentityServiceImpl::new().with_log_path(path.clone());
+        let (_key, device_id, token) = pair_and_authenticate(&first).await;
+        assert_eq!(
+            first.validate_session(token.clone()).await.unwrap(),
+            device_id
+        );
+
+        // A brand new instance, as if the process had restarted.
+        let second = IdentityServiceImpl::new().with_log_path(path.clone());
+        let applied = second.load_persisted().await.unwrap();
+        assert!(
+            applied >= 3,
+            "expected pairing + device + session events, applied {applied}"
+        );
+
+        assert_eq!(second.validate_session(token).await.unwrap(), device_id);
+
+        let devices = second.list_devices().await.unwrap();
+        assert!(devices
+            .iter()
+            .any(|d| d.id == device_id && !d.is_revoked && d.is_active));
+
+        let pairings = second.list_pairings().await.unwrap();
+        assert!(pairings.iter().any(|p| p.device_id == Some(device_id)
+            && p.state == PairingState::Approved));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_revocation_survives_restart() {
+        let path = temp_log_path("revoke");
+
+        let first = IdentityServiceImpl::new().with_log_path(path.clone());
+        let (key, device_id, token) = pair_and_authenticate(&first).await;
+        first.revoke_device(device_id).await.unwrap();
+
+        let second = IdentityServiceImpl::new().with_log_path(path.clone());
+        second.load_persisted().await.unwrap();
+
+        // The token issued before the restart must not come back to life.
+        let err = second.validate_session(token).await.unwrap_err();
+        assert!(err.to_string().contains("revoked"));
+
+        // Nor may the device pair itself a new session with its own key.
+        assert!(second
+            .authenticate_device(device_id, sign_device_id(&key, device_id))
+            .await
+            .is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_expired_session_is_not_restored() {
+        let path = temp_log_path("expired");
+        let now = chrono::Utc::now();
+        let event = IdentityEvent::Session {
+            token: "stale-token".to_string(),
+            session: SessionInfo {
+                id: SessionId::new(),
+                device_id: DeviceId::new(),
+                created_at: now - chrono::Duration::hours(2),
+                expires_at: now - chrono::Duration::minutes(1),
+                is_active: true,
+            },
+        };
+        std::fs::write(&path, format!("{}\n", serde_json::to_string(&event).unwrap()))
+            .unwrap();
+
+        let service = IdentityServiceImpl::new().with_log_path(path.clone());
+        assert_eq!(service.load_persisted().await.unwrap(), 1);
+        assert!(service.validate_session("stale-token".to_string()).await.is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_log_line_is_skipped() {
+        let path = temp_log_path("corrupt");
+        std::fs::write(&path, "this is not json\n\n").unwrap();
+
+        let service = IdentityServiceImpl::new().with_log_path(path.clone());
+        assert_eq!(service.load_persisted().await.unwrap(), 0);
+        // The service must still work after a damaged log.
+        service
+            .request_pairing("still-works".to_string(), test_public_key())
+            .await
+            .unwrap();
+        assert_eq!(service.list_pairings().await.unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 
