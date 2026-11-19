@@ -1181,8 +1181,10 @@ impl WorkspaceServiceImpl {
                 dest
             )));
         }
-        // Enforce discovery root `create` flag on the clone destination root.
-        self.check_discovery_root(&dest, "create")?;
+        // Enforce discovery root `create` flag on the workspace root (which
+        // already exists and is within a discovery root). The clone
+        // destination is a child of it, so the same enforcement applies.
+        self.check_discovery_root(&workspace.root, "create")?;
 
         // Run `git clone <url> <dest>`.
         let status = std::process::Command::new("git")
