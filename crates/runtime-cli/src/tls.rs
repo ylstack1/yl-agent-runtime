@@ -212,6 +212,137 @@ pub fn local_ipv4_addrs() -> Vec<IpAddr> {
     out
 }
 
+/// Which addresses get a listener, and with which transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerPlan {
+    /// Plain HTTP listeners (loopback, plus LAN addresses only when explicitly
+    /// allowed).
+    pub plain: Vec<std::net::SocketAddr>,
+    /// TLS listeners, one per local LAN address.
+    pub tls: Vec<std::net::SocketAddr>,
+    pub lan_ips: Vec<IpAddr>,
+}
+
+/// Plan the listeners for the current machine.
+pub fn plan_listeners(
+    host: &str,
+    port: u16,
+    allow_remote: bool,
+    tls_off: bool,
+    insecure: bool,
+) -> anyhow::Result<ListenerPlan> {
+    plan_listeners_with(host, port, allow_remote, tls_off, insecure, local_ipv4_addrs())
+}
+
+fn parse_addr(ip: &str, port: u16) -> anyhow::Result<std::net::SocketAddr> {
+    format!("{ip}:{port}")
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid listen address {ip}:{port}: {e}"))
+}
+
+fn plan_listeners_with(
+    host: &str,
+    port: u16,
+    allow_remote: bool,
+    tls_off: bool,
+    insecure: bool,
+    lan_ips: Vec<IpAddr>,
+) -> anyhow::Result<ListenerPlan> {
+    let loopback = "127.0.0.1";
+    let mut plain = Vec::new();
+    let mut tls = Vec::new();
+
+    if !allow_remote {
+        let bind_host = if host == "0.0.0.0" || host == "::" {
+            loopback
+        } else {
+            host
+        };
+        if bind_host == loopback || bind_host == "localhost" || bind_host == "::1" {
+            plain.push(parse_addr(loopback, port)?);
+        } else {
+            // An explicit non-loopback --host is a LAN bind: it needs TLS.
+            let ip: IpAddr = bind_host
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --host {bind_host}: {e}"))?;
+            if tls_off {
+                if !insecure {
+                    anyhow::bail!(
+                        "refusing plaintext on a LAN interface ({bind_host}); \
+                         pass --insecure-http or set remote.allow_plaintext_lan = true"
+                    );
+                }
+                plain.push(parse_addr(bind_host, port)?);
+            } else {
+                tls.push(parse_addr(bind_host, port)?);
+            }
+            return Ok(ListenerPlan {
+                plain,
+                tls,
+                lan_ips: vec![ip],
+            });
+        }
+        return Ok(ListenerPlan {
+            plain,
+            tls,
+            lan_ips: vec![],
+        });
+    }
+
+    // Remote: loopback stays plain, every LAN address gets TLS (or plaintext
+    // only with an explicit override).
+    plain.push(parse_addr(loopback, port)?);
+    if tls_off {
+        if !insecure {
+            anyhow::bail!(
+                "refusing plaintext on a LAN interface; \
+                 pass --insecure-http or set remote.allow_plaintext_lan = true"
+            );
+        }
+        for ip in &lan_ips {
+            plain.push(parse_addr(&ip.to_string(), port)?);
+        }
+    } else {
+        for ip in &lan_ips {
+            tls.push(parse_addr(&ip.to_string(), port)?);
+        }
+    }
+    Ok(ListenerPlan {
+        plain,
+        tls,
+        lan_ips,
+    })
+}
+
+/// Install the rustls crypto provider once per process. `axum-server` is built
+/// with `tls-rustls-no-provider`, so the provider choice stays ours (`ring`,
+/// never `aws-lc`).
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Serve `app` over TLS on an already-bound listener.
+pub async fn spawn_tls_listener(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    cert: &Path,
+    key: &Path,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    install_crypto_provider();
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+    let std_listener = listener.into_std()?;
+    std_listener.set_nonblocking(true)?;
+    let server = axum_server::from_tcp_rustls(std_listener, config)?;
+    Ok(tokio::spawn(async move {
+        if let Err(e) = server
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .await
+        {
+            warn!("tls listener stopped: {e}");
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +389,174 @@ mod tests {
         assert!(parts
             .iter()
             .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit())));
+    }
+
+    #[test]
+    fn listener_plan_is_plain_loopback_without_remote() {
+        let p = plan_listeners_with("127.0.0.1", 8077, false, false, false, vec![]).unwrap();
+        assert_eq!(p.plain, vec!["127.0.0.1:8077".parse().unwrap()]);
+        assert!(p.tls.is_empty());
+    }
+
+    #[test]
+    fn remote_plan_is_plain_loopback_plus_tls_on_each_lan_ip() {
+        let p = plan_listeners_with(
+            "127.0.0.1",
+            8077,
+            true,
+            false,
+            false,
+            vec!["192.168.1.5".parse().unwrap(), "10.0.0.7".parse().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(p.plain, vec!["127.0.0.1:8077".parse().unwrap()]);
+        assert_eq!(
+            p.tls,
+            vec![
+                "192.168.1.5:8077".parse().unwrap(),
+                "10.0.0.7:8077".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn plaintext_lan_requires_the_insecure_flag() {
+        let err = plan_listeners_with(
+            "192.168.1.5",
+            8077,
+            true,
+            true,
+            false,
+            vec!["192.168.1.5".parse().unwrap()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("insecure"), "{err}");
+        let ok = plan_listeners_with(
+            "192.168.1.5",
+            8077,
+            true,
+            true,
+            true,
+            vec!["192.168.1.5".parse().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(ok.plain.len(), 2);
+        assert!(ok.tls.is_empty());
+    }
+
+    #[test]
+    fn plan_never_contains_the_wildcard_address() {
+        let p = plan_listeners_with("0.0.0.0", 8077, true, false, false, vec![])
+            .unwrap();
+        assert!(p.plain.iter().all(|a| a.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)));
+        assert!(p.tls.iter().all(|a| a.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)));
+    }
+
+    async fn test_app() -> axum::Router {
+        axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }))
+    }
+
+    fn pinned_connector(cert_pem: &str) -> tokio_rustls::TlsConnector {
+        install_crypto_provider();
+        let der = rustls::pki_types::CertificateDer::from(cert_der(cert_pem).unwrap());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).unwrap();
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+    }
+
+    async fn send_health<S>(stream: &mut S, host: &str) -> String
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let request = format!(
+            "GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    #[tokio::test]
+    async fn https_get_with_pinned_cert_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let ip: IpAddr = "127.0.0.2".parse().unwrap();
+        let m = ensure_certificate(dir.path(), &[ip]).unwrap();
+        let listener = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = spawn_tls_listener(listener, test_app().await, &m.cert_path, &m.key_path)
+            .await
+            .unwrap();
+
+        let pem = std::fs::read_to_string(&m.cert_path).unwrap();
+        let connector = pinned_connector(&pem);
+        let tcp = tokio::net::TcpStream::connect((ip, port)).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from(ip.to_string()).unwrap();
+        let mut stream = connector.connect(server_name, tcp).await.unwrap();
+        let response = send_health(&mut stream, &ip.to_string()).await;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn plain_http_to_the_tls_port_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ip: IpAddr = "127.0.0.2".parse().unwrap();
+        let m = ensure_certificate(dir.path(), &[ip]).unwrap();
+        let listener = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = spawn_tls_listener(listener, test_app().await, &m.cert_path, &m.key_path)
+            .await
+            .unwrap();
+
+        let mut tcp = tokio::net::TcpStream::connect((ip, port)).await.unwrap();
+        let response = send_health(&mut tcp, &ip.to_string()).await;
+        assert!(!response.starts_with("HTTP/1.1 200"), "{response}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn plain_loopback_and_tls_share_the_same_port_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let ip: IpAddr = "127.0.0.2".parse().unwrap();
+        let m = ensure_certificate(dir.path(), &[ip]).unwrap();
+
+        let plain = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = plain.local_addr().unwrap().port();
+        let tls = tokio::net::TcpListener::bind((ip, port)).await.unwrap();
+
+        let app = test_app().await;
+        let plain_app = app.clone();
+        let plain_task = tokio::spawn(async move {
+            let _ = axum::serve(
+                plain,
+                plain_app
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        let tls_task = spawn_tls_listener(tls, app, &m.cert_path, &m.key_path)
+            .await
+            .unwrap();
+
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let plain_response = send_health(&mut tcp, "127.0.0.1").await;
+        assert!(plain_response.starts_with("HTTP/1.1 200"), "{plain_response}");
+
+        let pem = std::fs::read_to_string(&m.cert_path).unwrap();
+        let connector = pinned_connector(&pem);
+        let tcp = tokio::net::TcpStream::connect((ip, port)).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from(ip.to_string()).unwrap();
+        let mut stream = connector.connect(server_name, tcp).await.unwrap();
+        let tls_response = send_health(&mut stream, &ip.to_string()).await;
+        assert!(tls_response.starts_with("HTTP/1.1 200"), "{tls_response}");
+
+        plain_task.abort();
+        tls_task.abort();
     }
 }

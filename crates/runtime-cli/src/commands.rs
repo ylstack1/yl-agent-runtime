@@ -22,7 +22,8 @@ use runtime_undo::UndoJournal;
 use runtime_workspace::{
     discovery::DiscoveryService, SensitiveMatcher, WorkspaceService, WorkspaceServiceImpl,
 };
-use runtime_config::config::DiscoveryEntryKind;
+use crate::tls::{self, TlsMaterial};
+use runtime_config::config::{DiscoveryEntryKind, TlsMode};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -587,7 +588,14 @@ fn local_lan_ip() -> Option<std::net::IpAddr> {
     sock.local_addr().ok().map(|a| a.ip())
 }
 
-pub async fn run_http_server(host: String, port: u16, allow_remote: bool, yolo: bool, roots: Vec<String>) -> Result<()> {
+pub async fn run_http_server(
+    host: String,
+    port: u16,
+    allow_remote: bool,
+    yolo: bool,
+    roots: Vec<String>,
+    insecure_http: bool,
+) -> Result<()> {
     // 1. Load config.
     let config = match std::env::var("YL_RUNTIME_CONFIG").ok() {
         Some(path) if !path.is_empty() => Config::load_from_file(&PathBuf::from(path))?,
@@ -746,22 +754,22 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, yolo: 
     let host_is_loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
     let accept_any_host = allow_remote || !host_is_loopback;
 
-    let mut config = StreamableHttpServerConfig::default()
+    let mut mcp_config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false) // stateless for 2026-07-28
         .with_json_response(true)        // plain JSON replies (simpler than SSE)
         .disable_allowed_origins();      // clients may send any Origin
 
     if accept_any_host {
-        config = config.disable_allowed_hosts();
+        mcp_config = mcp_config.disable_allowed_hosts();
     } else {
-        config = config.with_allowed_hosts(["localhost", "127.0.0.1", "::1"]);
+        mcp_config = mcp_config.with_allowed_hosts(["localhost", "127.0.0.1", "::1"]);
     }
 
     let mcp_server_clone = mcp_server.clone();
     let mcp_service = StreamableHttpService::new(
         move || Ok(mcp_server_clone.clone()),
         LocalSessionManager::default().into(),
-        config,
+        mcp_config,
     );
 
     // Build the axum router: public health/pairing routes plus the MCP service
@@ -811,55 +819,109 @@ pub async fn run_http_server(host: String, port: u16, allow_remote: bool, yolo: 
         ))
         .with_state(app_state);
 
-    let addr: SocketAddr = if allow_remote {
-        format!("0.0.0.0:{}", port).parse()?
+    // 8. Transport plan: loopback stays plain (local MCP clients keep working),
+    //    every LAN address gets TLS so browsers have a secure context.
+    let tls_off = matches!(config.remote.tls, TlsMode::Off);
+    let insecure = insecure_http || config.remote.allow_plaintext_lan;
+    let plan = tls::plan_listeners(&host, port, allow_remote, tls_off, insecure)?;
+
+    let material: Option<TlsMaterial> = if plan.tls.is_empty() {
+        None
+    } else if let (Some(cert), Some(key)) = (
+        config.remote.tls_cert.clone(),
+        config.remote.tls_key.clone(),
+    ) {
+        let pem = std::fs::read_to_string(&cert).map_err(|e| {
+            anyhow::anyhow!("cannot read remote.tls_cert {}: {e}", cert.display())
+        })?;
+        Some(TlsMaterial {
+            fingerprint: tls::fingerprint_of(&tls::cert_der(&pem)?),
+            cert_path: cert,
+            key_path: key,
+            san_ips: plan.lan_ips.clone(),
+        })
     } else {
-        format!("{}:{}", host, port).parse()?
+        Some(tls::ensure_certificate(&config.data_dir, &plan.lan_ips)?)
     };
 
-    info!("YL Agent Runtime MCP HTTP server listening on http://{}", addr);
-    info!("MCP endpoint (this machine): http://127.0.0.1:{}/mcp", port);
-    if accept_any_host {
-        if let Some(ip) = local_lan_ip() {
-            info!("MCP endpoint (LAN devices): http://{}:{}/mcp", ip, port);
+    info!("MCP endpoint (this machine): http://127.0.0.1:{port}/mcp");
+    info!("Console (this machine): http://127.0.0.1:{port}/ui");
+    if allow_remote && plan.lan_ips.is_empty() {
+        warn!("No LAN IPv4 address detected; only loopback is being served");
+    }
+    for addr in &plan.tls {
+        info!("LAN console: https://{addr}/ui  (self-signed certificate)");
+        info!("LAN MCP endpoint: https://{addr}/mcp");
+    }
+    for addr in &plan.plain {
+        if !addr.ip().is_loopback() {
+            warn!("LAN console: http://{addr}/ui  (PLAINTEXT — explicitly allowed)");
         }
     }
+    if let Some(m) = &material {
+        info!("Certificate SHA-256 fingerprint: {}", m.fingerprint);
+    }
+    if tls_off && plan.lan_ips.iter().any(|_| true) && allow_remote {
+        warn!("TLS is off for LAN listeners: traffic is plaintext (explicitly allowed)");
+    }
 
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => listener,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // Very common in practice: a previous `yl serve` (possibly started
-            // from another terminal) is still holding the port. A raw
-            // "os error 10048" tells the user nothing, so say what is wrong and
-            // what to do.
-            let occupied = port_is_open(port).await;
-            let mut message = format!("port {port} is already in use");
-            if occupied {
-                message.push_str(
-                    " by a listening process — most likely a `yl serve` you started \
-                     earlier. If that is your runtime it is already up:\n",
-                );
-                message.push_str(&format!("  http://127.0.0.1:{port}/mcp\n"));
-                if accept_any_host {
-                    if let Some(ip) = local_lan_ip() {
-                        message.push_str(&format!("  http://{ip}:{port}/mcp  (LAN)\n"));
-                    }
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for addr in &plan.plain {
+        let listener = match tokio::net::TcpListener::bind(*addr).await {
+            Ok(listener) => listener,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                // Very common in practice: a previous `yl serve` (possibly started
+                // from another terminal) is still holding the port. A raw
+                // "os error 10048" tells the user nothing, so say what is wrong and
+                // what to do.
+                let occupied = port_is_open(port).await;
+                let mut message = format!("port {port} is already in use");
+                if occupied {
+                    message.push_str(
+                        " by a listening process — most likely a `yl serve` you started \
+                         earlier. If that is your runtime it is already up:\n",
+                    );
+                    message.push_str(&format!("  http://127.0.0.1:{port}/mcp\n"));
+                    message.push_str(&format!("  http://127.0.0.1:{port}/ui\n"));
+                    message.push_str("Stop the other instance before starting a new one.");
+                } else {
+                    message.push_str(
+                        " by another program. Pick a different port with --port <n>.",
+                    );
                 }
-                message.push_str("Stop the other instance before starting a new one.");
-            } else {
-                message.push_str(
-                    " by another program. Pick a different port with --port <n>.",
-                );
+                anyhow::bail!("{message}");
             }
-            anyhow::bail!("{message}");
-        }
-        Err(e) => return Err(e.into()),
-    };
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+            Err(e) => return Err(e.into()),
+        };
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                warn!("plain listener stopped: {e}");
+            }
+        }));
+    }
+    for addr in &plan.tls {
+        let listener = tokio::net::TcpListener::bind(*addr).await.map_err(|e| {
+            anyhow::anyhow!("cannot bind TLS listener on {addr}: {e}")
+        })?;
+        let material = material
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("internal: TLS listener without certificate"))?;
+        tasks.push(
+            tls::spawn_tls_listener(listener, app.clone(), &material.cert_path, &material.key_path)
+                .await?,
+        );
+    }
+
+    tokio::signal::ctrl_c().await.ok();
+    for task in tasks {
+        task.abort();
+    }
 
     Ok(())
 }

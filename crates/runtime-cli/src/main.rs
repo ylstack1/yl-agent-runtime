@@ -75,6 +75,9 @@ enum Commands {
         yolo: bool,
         #[arg(long = "root")]
         roots: Vec<String>,
+        /// Allow plaintext HTTP on a LAN interface (discouraged)
+        #[arg(long)]
+        insecure_http: bool,
     },
     /// Discovery roots: list, browse, detect projects under authorized roots.
     #[command(subcommand)]
@@ -159,8 +162,9 @@ async fn main() -> anyhow::Result<()> {
             allow_remote,
             yolo,
             roots,
+            insecure_http,
         } => {
-            commands::run_http_server(host, port, allow_remote, yolo, roots).await?;
+            commands::run_http_server(host, port, allow_remote, yolo, roots, insecure_http).await?;
         }
         Commands::Discovery(action) => {
             commands::run_discovery(action).await?;

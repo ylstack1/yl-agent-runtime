@@ -86,6 +86,17 @@ pub struct TransportConfig {
     pub enable_iroh: bool,
 }
 
+/// TLS mode for the LAN listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    /// Generate/load a self-signed certificate for every local LAN address.
+    #[default]
+    Auto,
+    /// Serve plaintext on the LAN. Refused unless explicitly overridden.
+    Off,
+}
+
 /// Remote configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteConfig {
@@ -94,6 +105,17 @@ pub struct RemoteConfig {
     pub session_timeout_seconds: u64,
     pub rate_limit_per_minute: u32,
     pub max_request_size_mb: u64,
+    /// Transport for non-loopback listeners. Defaults to TLS.
+    #[serde(default)]
+    pub tls: TlsMode,
+    /// Operator-supplied certificate/key (both must be set to take effect).
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+    /// Explicit opt-out: allow plaintext on a LAN interface.
+    #[serde(default)]
+    pub allow_plaintext_lan: bool,
 }
 
 /// Workspace configuration: registered file roots and size limits.
@@ -291,6 +313,10 @@ impl Config {
                 session_timeout_seconds: 3600,
                 rate_limit_per_minute: 100,
                 max_request_size_mb: 10,
+                tls: TlsMode::Auto,
+                tls_cert: None,
+                tls_key: None,
+                allow_plaintext_lan: false,
             },
             workspace: WorkspaceConfig::default(),
             discovery: DiscoveryConfig::default(),
@@ -468,5 +494,25 @@ max_request_size_mb = 10
         assert!(config.discovery.enabled);
         assert!(config.discovery.roots.is_empty());
         assert_eq!(config.discovery.max_entries_per_page, 250);
+    }
+
+    #[test]
+    fn remote_config_defaults_to_tls_auto_when_fields_are_absent() {
+        let config: Config = toml::from_str(&base_toml()).unwrap();
+        assert!(matches!(config.remote.tls, TlsMode::Auto));
+        assert!(!config.remote.allow_plaintext_lan);
+        assert!(config.remote.tls_cert.is_none());
+        assert!(config.remote.tls_key.is_none());
+    }
+
+    #[test]
+    fn remote_config_accepts_tls_off() {
+        let content = base_toml().replace(
+            "max_request_size_mb = 10",
+            "max_request_size_mb = 10\ntls = \"off\"\nallow_plaintext_lan = true",
+        );
+        let config: Config = toml::from_str(&content).unwrap();
+        assert!(matches!(config.remote.tls, TlsMode::Off));
+        assert!(config.remote.allow_plaintext_lan);
     }
 }
