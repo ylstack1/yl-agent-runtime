@@ -132,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
             DevicesAction::Revoke { device_id } => commands::revoke_device(&device_id).await,
         },
         Commands::RegisterWorkspace { path } => {
-            commands::register_workspace(&path).await;
+            commands::run_workspace(crate::commands::WorkspaceAction::Register { path }).await?;
         }
         Commands::Mcp {
             roots,

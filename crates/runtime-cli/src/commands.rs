@@ -23,7 +23,7 @@ use runtime_workspace::{
     discovery::DiscoveryService, SensitiveMatcher, WorkspaceService, WorkspaceServiceImpl,
 };
 use crate::tls::{self, TlsMaterial};
-use runtime_config::config::{DiscoveryEntryKind, TlsMode};
+use runtime_config::config::{TlsMode};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -1549,51 +1549,84 @@ pub enum WorkspaceAction {
 /// Backed by `WorkspaceServiceImpl` — the same service a future desktop
 /// controller GUI would call, keeping CLI and GUI consistent.
 pub async fn run_workspace(action: WorkspaceAction) -> Result<()> {
-    let config = Config::load_from_file(&PathBuf::from("./config/runtime.toml"))
-        .unwrap_or_else(|_| Config::default());
-
-    let service =
-        WorkspaceServiceImpl::with_data_dir(config.data_dir.clone(), config.discovery.clone())?;
-
     match action {
         WorkspaceAction::List => {
-            let records = service.list_workspaces();
-            if records.is_empty() {
+            let value = host_api(reqwest::Method::GET, "/api/v1/workspaces", None).await?;
+            let workspaces = value
+                .get("workspaces")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if workspaces.is_empty() {
                 println!("No workspaces registered.");
                 return Ok(());
             }
             println!("Registered workspaces:");
-            for rec in records {
+            for w in workspaces {
+                let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let name = w
+                    .get("display_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let root_id = w.get("root_id").and_then(|v| v.as_str()).unwrap_or("-");
+                let rel = w
+                    .get("relative_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let profile = w.get("profile").and_then(|v| v.as_str()).unwrap_or("");
                 println!(
-                    "  {} | {} | origin={:?} | profile={:?} | root={}",
-                    rec.id,
-                    rec.display_name,
-                    rec.origin,
-                    rec.profile,
-                    rec.root.display()
+                    "  {} | {} | root={}/{} | profile={} | origin={}",
+                    id,
+                    name,
+                    root_id,
+                    rel,
+                    profile,
+                    w.get("origin").and_then(|v| v.as_str()).unwrap_or("")
                 );
             }
         }
         WorkspaceAction::Register { path } => {
-            let root = PathBuf::from(&path);
-            let id = service.register(root, ExecutionProfile::Development).await?;
-            println!("Registered workspace {} at {}", id, path);
+            let value = host_api(
+                reqwest::Method::POST,
+                "/api/v1/workspaces/register",
+                Some(serde_json::json!({ "root_id": "default", "relative_path": path })),
+            )
+            .await?;
+            let id = value
+                .get("workspace_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let already = value.get("already_registered").and_then(|v| v.as_bool()).unwrap_or(false);
+            if already {
+                println!("Workspace already registered: {} (reused existing id)", id);
+            } else {
+                println!("Registered workspace {} at {}", id, path);
+            }
         }
         WorkspaceAction::Unregister { id } => {
-            let project_id =
-                uuid::Uuid::parse_str(&id).map_err(|e| anyhow::anyhow!("invalid workspace id: {e}"))?;
-            service.unregister(ProjectId(project_id)).await?;
+            host_api(
+                reqwest::Method::DELETE,
+                &format!("/api/v1/workspaces/{id}"),
+                None,
+            )
+            .await?;
             println!("Unregistered workspace {}", id);
         }
         WorkspaceAction::Create { parent, name } => {
-            let id = service
-                .create_workspace(
-                    Path::new(&parent),
-                    &name,
-                    ExecutionProfile::Development,
-                    &[],
-                )
-                .await?;
+            let value = host_api(
+                reqwest::Method::POST,
+                "/api/v1/workspaces/create",
+                Some(serde_json::json!({
+                    "root_id": "default",
+                    "relative_path": parent,
+                    "name": name,
+                })),
+            )
+            .await?;
+            let id = value
+                .get("workspace_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             println!("Created workspace {} at {}/{}", id, parent, name);
         }
     }
@@ -1602,32 +1635,34 @@ pub async fn run_workspace(action: WorkspaceAction) -> Result<()> {
 
 /// Discovery root commands: list, browse, detect, enable, disable.
 ///
-/// Backed by `DiscoveryService` in `runtime-workspace` — the same service a
-/// future desktop controller GUI would call, keeping CLI and GUI consistent.
+/// Talks to the running server's `/api/v1/discovery/*` endpoints via
+/// `host_api` — the same HTTP API the `/ui` console uses. Keeps CLI and GUI
+/// consistent: both are clients of the live server.
 pub async fn run_discovery(action: DiscoveryAction) -> Result<()> {
-    let config = Config::load_from_file(&PathBuf::from("./config/runtime.toml"))
-        .unwrap_or_else(|_| Config::default());
-
-    let service = DiscoveryService::from_config(config.discovery)?;
-
     match action {
         DiscoveryAction::Roots => {
-            if service.list_roots().is_empty() {
+            let value = host_api(reqwest::Method::GET, "/api/v1/discovery/roots", None).await?;
+            let roots = value
+                .get("roots")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if roots.is_empty() {
                 println!("No discovery roots configured.");
                 return Ok(());
             }
             println!("Discovery roots:");
-            for root in service.list_roots() {
+            for root in roots {
+                let id = root.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let label = root.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                let enabled = root.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                let browse = root.get("browse").and_then(|v| v.as_bool()).unwrap_or(false);
+                let create = root.get("create").and_then(|v| v.as_bool()).unwrap_or(false);
+                let register = root.get("register").and_then(|v| v.as_bool()).unwrap_or(false);
+                let synthetic = root.get("synthetic").and_then(|v| v.as_bool()).unwrap_or(false);
                 println!(
-                    "  {} | {} | enabled={} browse={} create={} register={} import={} clone={}",
-                    root.id,
-                    root.label,
-                    root.enabled,
-                    root.browse,
-                    root.create,
-                    root.register,
-                    root.import,
-                    root.clone,
+                    "  {} | {} | enabled={} browse={} create={} register={} synthetic={}",
+                    id, label, enabled, browse, create, register, synthetic
                 );
             }
         }
@@ -1637,44 +1672,78 @@ pub async fn run_discovery(action: DiscoveryAction) -> Result<()> {
             cursor,
             limit,
         } => {
-            let result = service.browse_root(&root, &path, cursor, Some(limit))?;
-            println!("root={} path={}", result.root_id, result.path);
-            println!(
-                "cursor={:?} next_cursor={:?} has_more={}",
-                result.cursor, result.next_cursor, result.has_more
-            );
-            for entry in result.entries {
-                let kind = match entry.entry_kind {
-                    DiscoveryEntryKind::Directory => "dir",
-                    DiscoveryEntryKind::File => "file",
+            let mut params = format!("?path={path}");
+            if let Some(c) = cursor {
+                params.push_str(&format!("&cursor={c}"));
+            }
+            params.push_str(&format!("&limit={limit}"));
+            let value = host_api(
+                reqwest::Method::GET,
+                &format!("/api/v1/discovery/roots/{root}/entries{params}"),
+                None,
+            )
+            .await?;
+            let entries = value
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            println!("root={} path={}", root, path);
+            for entry in entries {
+                let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let kind = if entry.get("kind").and_then(|v| v.as_str()) == Some("directory") {
+                    "dir"
+                } else {
+                    "file"
                 };
-                println!(
-                    "  {} {} {}B {}",
-                    kind,
-                    entry.name,
-                    entry.size,
-                    if entry.hidden { "(hidden)" } else { "" }
-                );
+                let size = entry.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("  {kind} {name} {size}B");
             }
         }
         DiscoveryAction::Detect { root, path } => {
-            let det = service.detect_project(&root, &path)?;
-            println!("root={} path={}", det.root_id, det.relative_path);
-            println!("project_types={:?}", det.project_types);
-            println!("git_present={} git_branch={:?}", det.git_present, det.git_branch);
-            println!("confidence={:.2}", det.confidence);
-            println!("markers={:?}", det.markers);
-            if det.scan_limits_hit {
-                println!("scan_limits_hit=true");
-            }
+            let value = host_api(
+                reqwest::Method::POST,
+                "/api/v1/projects/detect",
+                Some(serde_json::json!({ "root_id": root, "relative_path": path })),
+            )
+            .await?;
+            let types = value
+                .get("project_types")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            println!("root={} path={}", root, path);
+            println!("project_types={types}");
+            println!(
+                "markers={:?}",
+                value.get("markers").and_then(|v| v.as_array())
+            );
+            println!("confidence={:.2}", value.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0));
         }
         DiscoveryAction::Enable { root } => {
-            service.set_root_enabled(&root, true)?;
-            println!("root {} enabled", root);
+            let value = host_api(
+                reqwest::Method::PATCH,
+                &format!("/api/v1/discovery/roots/{root}"),
+                Some(serde_json::json!({ "enabled": true })),
+            )
+            .await?;
+            let enabled = value.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            println!("root {} enabled={}", root, enabled);
         }
         DiscoveryAction::Disable { root } => {
-            service.set_root_enabled(&root, false)?;
-            println!("root {} disabled", root);
+            let value = host_api(
+                reqwest::Method::PATCH,
+                &format!("/api/v1/discovery/roots/{root}"),
+                Some(serde_json::json!({ "enabled": false })),
+            )
+            .await?;
+            let enabled = value.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            println!("root {} enabled={}", root, enabled);
         }
     }
     Ok(())
