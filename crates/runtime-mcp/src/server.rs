@@ -39,8 +39,8 @@ use runtime_workspace::files::write::WriteOptions;
 use runtime_workspace::search::{FindOptions, SearchOptions};
 use crate::args::normalize_args;
 use crate::tools_fs::{
-    AllowedRootsArgs, DeleteArgs, EditArgs, FindFilesArgs, GitBranchArgs, GitCommitArgs,
-    GitDiffArgs, GitLogArgs, GitRootArgs, GitStatusArgs, invalid, ListArgs,
+    AllowedRootsArgs, DeleteArgs, EditArgs, FindFilesArgs, GitBranchArgs, GitCloneArgs,
+    GitCommitArgs, GitDiffArgs, GitLogArgs, GitRootArgs, GitStatusArgs, invalid, ListArgs,
     MkdirArgs, MoveArgs, output_json, PatchArgs, ProcessExecArgs, ProcessInteractArgs,
     ProcessListArgs, ProcessReadArgs, ProcessStartArgs, ProcessStopArgs, ReadArgs, ReadManyArgs,
     ReplaceTextArgs, resolve_project, SearchArgs, StatArgs, TreeArgs, TreeBudgetExceeded,
@@ -211,6 +211,28 @@ fn read_outcome_json(outcome: ReadOutcome) -> serde_json::Value {
         }),
         ReadOutcome::Binary { size } => json!({ "binary": true, "size": size }),
     }
+}
+
+/// Redact embedded credentials from a Git URL for logging/audit display.
+///
+/// `https://user:token@github.com/owner/repo.git` →
+/// `https://<redacted>@github.com/owner/repo.git`
+///
+/// SSH URLs (`git@github.com:owner/repo.git`) have no embedded credentials
+/// and pass through unchanged. The original URL is still passed to git; only
+/// the server-side display/audit copy is redacted.
+fn redact_url_credentials(url: &str) -> String {
+    if let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    {
+        if let Some(at_pos) = rest.find('@') {
+            let scheme = url.split("://").next().unwrap_or(url);
+            let host_path = &rest[at_pos + 1..];
+            return format!("{scheme}://<redacted>@{host_path}");
+        }
+    }
+    url.to_string()
 }
 
 /// Derive a stable AgentId from a principal-agent name so policy grants
@@ -1114,6 +1136,120 @@ impl McpServer {
         }))
     }
 
+    /// Clone a Git repository into a discovery root. Starts a long-running
+    /// `git clone` process; the client polls `process.read` for progress and
+    /// `process.stop` to cancel. The checkout is NOT registered as a workspace
+    /// until the client calls `workspace.register` after clone succeeds.
+    ///
+    /// `url` may contain embedded credentials (`user:pass@host`); they are
+    /// stripped before logging/audit but still passed to git.
+    #[tool(
+        name = "git.clone",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "Git repository URL (HTTPS or SSH)" },
+                        "root": { "type": "string", "description": "Discovery root id (clone target must be inside it)" },
+                        "dest": { "type": "string", "description": "Destination directory relative to the root" },
+                        "branch": { "type": "string", "description": "Branch/tag/commit to check out" },
+                        "depth": { "type": "integer", "description": "Shallow clone depth", "minimum": 1 }
+                    },
+                    "required": ["url", "root", "dest"]
+                })
+            )
+            .expect("invalid git.clone input schema")
+        )
+    )]
+    async fn git_clone(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("git.clone", &args.0)?;
+        let args: GitCloneArgs =
+            serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| invalid(format!("failed to deserialize parameters: {e}")))?;
+
+        // Validate URL is non-empty and looks like a git URL.
+        if args.url.trim().is_empty() {
+            return Err(invalid("git.clone: 'url' must not be empty"));
+        }
+
+        // Resolve and validate the clone destination within the discovery root.
+        let dest_absolute = self
+            .fs
+            .validate_clone_dest(&args.root_id, &args.dest)
+            .map_err(Self::map_runtime_error)?;
+
+        // Approval gate: cloning writes to the filesystem, requires consent.
+        let url_for_audit = redact_url_credentials(&args.url);
+        self.enforce_tool(
+            Capability::GitWrite,
+            Some(&format!("git clone {} into {}", url_for_audit, args.dest)),
+        )
+        .await?;
+
+        // Build `git clone` arguments.
+        let mut git_args = vec!["clone".to_string()];
+        if let Some(branch) = &args.branch {
+            git_args.push("--branch".to_string());
+            git_args.push(branch.clone());
+        }
+        if let Some(depth) = args.depth {
+            git_args.push("--depth".to_string());
+            git_args.push(depth.to_string());
+        }
+        git_args.push(args.url.clone());
+        git_args.push(dest_absolute.to_string_lossy().to_string());
+
+        // Determine the parent directory of the destination as the working
+        // directory (git clone creates the destination directory itself).
+        let work_dir = dest_absolute
+            .parent()
+            .unwrap_or(&dest_absolute)
+            .to_path_buf();
+
+        let request = ExecutionRequest {
+            id: ProcessId::new(),
+            session_id: self.session_id,
+            project_id: ProjectId::nil(),
+            agent_id: self.agent_id,
+            executable: PathBuf::from("git"),
+            arguments: git_args,
+            environment: HashMap::new(),
+            working_directory: work_dir,
+            profile: ExecutionProfile::Development,
+            capabilities: vec![],
+            max_runtime_seconds: Some(3600), // 1 hour max for clone
+            max_processes: None,
+            memory_limit_mb: None,
+            stdin_data: None,
+        };
+
+        let handle = self
+            .process_service
+            .start(request)
+            .await
+            .map_err(Self::map_runtime_error)?;
+
+        // Audit the clone start (credentials already redacted).
+        self.record_audit(
+            AuditEventType::GitCommit, // reuse existing event; clone is a git write
+            None, // workspace not registered yet; no project id
+            Some(format!("git clone {} into {}", url_for_audit, args.dest)),
+        )
+        .await;
+
+        output_json(&json!({
+            "process_id": handle.id,
+            "os_pid": handle.os_pid,
+            "url": url_for_audit,
+            "dest": args.dest,
+            "dest_absolute": dest_absolute.to_string_lossy().to_string(),
+            "status": "started",
+            "branch": args.branch,
+            "depth": args.depth,
+        }))
+    }
+
     /// Read a file's text content.
     #[tool(
         name = "workspace.read",
@@ -1985,6 +2121,78 @@ impl McpServer {
                 .iter()
                 .map(|root| root.display().to_string())
                 .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Register an existing directory as a workspace. Requires approval via
+    /// the `WorkspaceRegister` capability gate; on `Ask`, returns an
+    /// `approval_id` to approve and retry.
+    #[tool(
+        name = "workspace.register",
+        input_schema = Arc::new(
+            serde_json::from_value::<JsonObject>(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "profile": { "type": "string", "description": "execution profile (development, inspect); default development" }
+                    },
+                    "required": ["path"]
+                })
+            )
+            .expect("invalid workspace.register input schema")
+        )
+    )]
+    async fn workspace_register(&self, args: Parameters<JsonObject>) -> Result<CallToolResult, McpError> {
+        let args = normalize_args("workspace.register", &args.0)?;
+        let path_str: String = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| invalid("workspace.register requires a `path` argument"))?;
+        let profile_str: String = args
+            .get("profile")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "development".to_string());
+        let profile = match profile_str.as_str() {
+            "inspect" => ExecutionProfile::Inspect,
+            _ => ExecutionProfile::Development,
+        };
+
+        let path = PathBuf::from(&path_str);
+        if !path.exists() {
+            return Err(invalid(format!(
+                "workspace.register: path does not exist: {path_str}"
+            )));
+        }
+        if !path.is_dir() {
+            return Err(invalid(format!(
+                "workspace.register: path is not a directory: {path_str}"
+            )));
+        }
+
+        // Approval gate: registering a workspace requires consent.
+        self.enforce_tool(Capability::WorkspaceRegister, Some(&path_str))
+            .await?;
+
+        let id = self
+            .fs
+            .register(path, profile)
+            .await
+            .map_err(Self::map_runtime_error)?;
+
+        self.record_audit(
+            AuditEventType::WorkspaceRegister,
+            Some(id),
+            Some(path_str.clone()),
+        )
+        .await;
+
+        output_json(&json!({
+            "id": id,
+            "path": path_str,
+            "profile": profile_str,
         }))
     }
 

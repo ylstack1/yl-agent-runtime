@@ -36,6 +36,8 @@ runtime-toolchain = { path = "../runtime-toolchain" }
 axum = { workspace = true }
 tower-http = { workspace = true }
 reqwest = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

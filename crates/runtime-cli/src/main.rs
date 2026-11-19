@@ -23,17 +23,18 @@ enum Commands {
     Status,
     /// Discover installed toolchains
     DiscoverTools,
-    /// Pair a new device
-    Pair {
-        #[arg(short, long)]
-        device_name: Option<String>,
-    },
+    /// Pairing: request/approve/reject/status/authenticate remote devices
+    #[command(subcommand)]
+    Pairing(PairingAction),
     /// List registered devices
     ListDevices,
     /// Revoke a device
     RevokeDevice {
         device_id: String,
     },
+    /// Paired devices: list or revoke
+    #[command(subcommand)]
+    Devices(DevicesAction),
     /// Register a workspace
     RegisterWorkspace {
         path: String,
@@ -75,6 +76,12 @@ enum Commands {
         #[arg(long = "root")]
         roots: Vec<String>,
     },
+    /// Discovery roots: list, browse, detect projects under authorized roots.
+    #[command(subcommand)]
+    Discovery(DiscoveryAction),
+    /// Workspace registry: list, register, unregister, create workspaces.
+    #[command(subcommand)]
+    Workspace(WorkspaceAction),
     /// Manage approval requests (approve/reject/list pending approvals)
     Approval {
         #[command(subcommand)]
@@ -84,7 +91,7 @@ enum Commands {
 
 mod commands;
 
-use commands::ApprovalAction;
+use commands::{ApprovalAction, DevicesAction, DiscoveryAction, PairingAction, WorkspaceAction};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -106,8 +113,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::DiscoverTools => {
             commands::discover_tools().await;
         }
-        Commands::Pair { device_name } => {
-            commands::pair_device(device_name.as_deref()).await;
+        Commands::Pairing(action) => {
+            commands::run_pairing(action).await?;
         }
         Commands::ListDevices => {
             commands::list_devices().await;
@@ -115,6 +122,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::RevokeDevice { device_id } => {
             commands::revoke_device(&device_id).await;
         }
+        Commands::Devices(action) => match action {
+            DevicesAction::List => commands::list_devices().await,
+            DevicesAction::Revoke { device_id } => commands::revoke_device(&device_id).await,
+        },
         Commands::RegisterWorkspace { path } => {
             commands::register_workspace(&path).await;
         }
@@ -149,6 +160,12 @@ async fn main() -> anyhow::Result<()> {
             roots,
         } => {
             commands::run_http_server(host, port, allow_remote, yolo, roots).await?;
+        }
+        Commands::Discovery(action) => {
+            commands::run_discovery(action).await?;
+        }
+        Commands::Workspace(action) => {
+            commands::run_workspace(action).await?;
         }
         Commands::Approval { action } => {
             commands::run_approval(action).await?;

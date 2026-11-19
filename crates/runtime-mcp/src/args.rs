@@ -61,6 +61,7 @@ pub const ALIASES: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     ("workspace.stat", &[("file", "path"), ("target", "path")]),
+    ("workspace.register", &[("directory", "path"), ("dir", "path")]),
     (
         "process.start",
         &[
@@ -116,6 +117,8 @@ pub const REQUIRED: &[(&str, &[&str])] = &[
     ("workspace.find_files", &["pattern"]),
     ("workspace.tree", &["path"]),
     ("workspace.mkdir", &["path"]),
+    ("workspace.register", &["path"]),
+    ("git.clone", &["url", "root", "dest"]),
     ("workspace.move", &["source", "destination"]),
     ("workspace.delete", &["paths"]),
     ("workspace.stat", &["path"]),
@@ -177,6 +180,7 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("workspace.tree", &["path", "depth", "exclude_patterns"]),
     ("workspace.stat", &["path"]),
     ("workspace.mkdir", &["path"]),
+    ("workspace.register", &["path"]),
     ("workspace.move", &["source", "destination"]),
     ("workspace.delete", &["paths", "recursive"]),
     ("workspace.allowed_roots", &[]),
@@ -193,6 +197,7 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("git.log", &["project_id", "max_count", "path"]),
     ("git.branch", &["project_id"]),
     ("git.commit", &["project_id", "message", "files"]),
+    ("git.clone", &["project_id", "url", "root", "dest", "branch", "depth"]),
     ("approval.request", &["capability", "resource", "justification"]),
     ("approval.approve", &["approval_id"]),
     ("approval.reject", &["approval_id", "reason"]),

@@ -7,6 +7,7 @@ pub mod service;
 pub mod path_safety;
 pub mod operations;
 pub mod sensitive;
+pub mod discovery;
 pub mod files;
 pub mod search;
 
