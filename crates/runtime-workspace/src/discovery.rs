@@ -387,6 +387,7 @@ mod tests {
                 register: true,
                 import: true,
                 clone: true,
+                synthetic: false,
             }],
             ..Default::default()
         }

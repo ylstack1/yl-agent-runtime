@@ -206,10 +206,62 @@ pub struct DiscoveryRoot {
     pub import: bool,
     #[serde(default = "default_true")]
     pub clone: bool,
+    /// True when this root was derived from a workspace root because
+    /// `[discovery].roots` was empty. Never serialized by operators.
+    #[serde(default)]
+    pub synthetic: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Fill in discovery roots from workspace roots when `[discovery].roots` is
+/// empty, so browsing still has an enforced boundary instead of silently
+/// disabling containment checks.
+pub fn effective_discovery(
+    config: &DiscoveryConfig,
+    writable: &[PathBuf],
+    read_only: &[PathBuf],
+) -> DiscoveryConfig {
+    if !config.roots.is_empty() {
+        return config.clone();
+    }
+    let mut out = config.clone();
+    for (index, path) in writable.iter().enumerate() {
+        out.roots.push(synthetic_root(
+            format!("ws-{}", index + 1),
+            path,
+            true,
+        ));
+    }
+    for (index, path) in read_only.iter().enumerate() {
+        out.roots.push(synthetic_root(
+            format!("ro-{}", index + 1),
+            path,
+            false,
+        ));
+    }
+    out
+}
+
+fn synthetic_root(id: String, path: &PathBuf, writable: bool) -> DiscoveryRoot {
+    DiscoveryRoot {
+        id,
+        label: path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| path.display().to_string()),
+        path: path.clone(),
+        enabled: true,
+        browse: true,
+        create: writable,
+        register: writable,
+        import: false,
+        clone: false,
+        synthetic: true,
+    }
 }
 
 /// Discovery configuration: configurable roots and browsing limits.
@@ -514,5 +566,42 @@ max_request_size_mb = 10
         let config: Config = toml::from_str(&content).unwrap();
         assert!(matches!(config.remote.tls, TlsMode::Off));
         assert!(config.remote.allow_plaintext_lan);
+    }
+
+    #[test]
+    fn empty_discovery_roots_are_synthesized_from_workspace_roots() {
+        let cfg = effective_discovery(
+            &DiscoveryConfig::default(),
+            &[PathBuf::from("/w/a")],
+            &[PathBuf::from("/ro/b")],
+        );
+        assert_eq!(cfg.roots.len(), 2);
+        assert!(cfg.roots[0].synthetic);
+        assert!(cfg.roots[0].browse && cfg.roots[0].register && cfg.roots[0].create);
+        assert!(!cfg.roots[0].import && !cfg.roots[0].clone);
+        assert!(cfg.roots[1].synthetic);
+        assert!(cfg.roots[1].browse);
+        assert!(!cfg.roots[1].register && !cfg.roots[1].create);
+        assert_eq!(cfg.roots[0].label, "a");
+    }
+
+    #[test]
+    fn configured_roots_win_over_synthesis() {
+        let mut cfg = DiscoveryConfig::default();
+        cfg.roots.push(DiscoveryRoot {
+            id: "x".into(),
+            label: "x".into(),
+            path: PathBuf::from("/x"),
+            enabled: true,
+            browse: true,
+            create: false,
+            register: false,
+            import: false,
+            clone: false,
+            synthetic: false,
+        });
+        let out = effective_discovery(&cfg, &[PathBuf::from("/w/a")], &[]);
+        assert_eq!(out.roots.len(), 1);
+        assert_eq!(out.roots[0].id, "x");
     }
 }

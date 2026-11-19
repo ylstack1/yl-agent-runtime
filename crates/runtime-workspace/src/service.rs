@@ -306,6 +306,27 @@ impl WorkspaceServiceImpl {
         0
     }
 
+    /// Clone of the discovery config that enforces register/create. The HTTP
+    /// layer needs this to build its read-only `DiscoveryService` from the same
+    /// roots the service is enforcing.
+    pub fn discovery_config(&self) -> DiscoveryConfig {
+        self.discovery.read().unwrap().clone()
+    }
+
+    /// Enable/disable a discovery root for enforcement (register/create). The
+    /// HTTP handler calls this together with `DiscoveryService::set_root_enabled`
+    /// so browsing and registration move together. In-memory only.
+    pub fn set_discovery_root_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let mut config = self.discovery.write().unwrap();
+        let root = config
+            .roots
+            .iter_mut()
+            .find(|root| root.id == id)
+            .ok_or_else(|| Error::Validation(format!("Discovery root not found: {id}")))?;
+        root.enabled = enabled;
+        Ok(())
+    }
+
     /// Sensitive-file guard on a resolved path.
     ///
     /// `verdict != Allowed` → `Error::PathNotAllowed("Sensitive file blocked:
@@ -1881,6 +1902,7 @@ diff --git a/b.txt b/b.txt
                 register: false, // registration not allowed
                 import: true,
                 clone: true,
+                synthetic: false,
             }],
             ..Default::default()
         };
@@ -1912,6 +1934,7 @@ diff --git a/b.txt b/b.txt
                     register: true,
                     import: true,
                     clone: true,
+                    synthetic: false,
                 }],
                 ..Default::default()
             },
@@ -1943,6 +1966,7 @@ diff --git a/b.txt b/b.txt
                 register: true,
                 import: true,
                 clone: true,
+                synthetic: false,
             }],
             ..Default::default()
         };
@@ -1974,6 +1998,7 @@ diff --git a/b.txt b/b.txt
                 register: true,
                 import: true,
                 clone: true,
+                synthetic: false,
             }],
             ..Default::default()
         };
@@ -1985,5 +2010,32 @@ diff --git a/b.txt b/b.txt
             .await
             .unwrap();
         assert!(service.list_workspaces().iter().any(|r| r.id == id));
+    }
+
+    #[tokio::test]
+    async fn discovery_toggle_moves_the_enforcement_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = DiscoveryConfig {
+            roots: vec![runtime_config::config::DiscoveryRoot {
+                id: "r".to_string(),
+                label: "R".to_string(),
+                path: root,
+                enabled: true,
+                browse: true,
+                create: true,
+                register: true,
+                import: false,
+                clone: false,
+                synthetic: false,
+            }],
+            ..Default::default()
+        };
+        let service = WorkspaceServiceImpl::with_data_dir(dir.path().join("data"), config).unwrap();
+        assert!(service.discovery_config().roots[0].enabled);
+        service.set_discovery_root_enabled("r", false).unwrap();
+        assert!(!service.discovery_config().roots[0].enabled);
+        assert!(service.set_discovery_root_enabled("missing", false).is_err());
     }
 }
