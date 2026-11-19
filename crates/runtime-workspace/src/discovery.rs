@@ -34,6 +34,9 @@ pub struct ConfiguredRoot {
     pub register: bool,
     pub import: bool,
     pub clone: bool,
+    /// True when the root was synthesized from a workspace root because
+    /// `[discovery].roots` was empty.
+    pub synthetic: bool,
 }
 
 /// Marker files used for bounded project detection. Each entry is
@@ -99,6 +102,7 @@ impl DiscoveryService {
                     register: root.register,
                     import: root.import,
                     clone: root.clone,
+                    synthetic: root.synthetic,
                 },
             );
             validators.write().unwrap().insert(root.id.clone(), validator);
@@ -163,6 +167,16 @@ impl DiscoveryService {
             })?;
         let abs_path = contained.absolute_path.clone();
         Ok(abs_path)
+    }
+
+    /// Resolve a root-relative path to an absolute path, enforcing containment.
+    ///
+    /// Unlike [`Self::browse_root`] this does **not** require the `browse` flag:
+    /// callers that need another permission (`register`, `create`) use this and
+    /// let the workspace service enforce its own flag.
+    pub fn resolve_relative(&self, root_id: &str, rel_path: &str) -> Result<PathBuf> {
+        let root = self.require_enabled_root(root_id)?;
+        self.resolve_within_root(&root, Path::new(rel_path))
     }
 
     /// Paginated browse of a directory under a discovery root. `cursor` is an

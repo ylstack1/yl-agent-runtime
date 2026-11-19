@@ -375,3 +375,150 @@ async fn malformed_json_is_400_with_a_json_error() {
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert!(body.get("error").is_some(), "{body}");
 }
+
+// ---- Task 5: discovery ---------------------------------------------------
+
+#[tokio::test]
+async fn roots_list_exposes_flags_but_no_absolute_paths() {
+    let app = build(true, 1000).await;
+    let (status, body, _) = send(
+        &app.router,
+        "GET",
+        "/api/v1/discovery/roots",
+        LOOPBACK,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let roots = body["roots"].as_array().unwrap();
+    assert_eq!(roots.len(), 1, "{body}");
+    let root = &roots[0];
+    assert_eq!(root["id"], "test-root");
+    for flag in ["enabled", "browse", "create", "register", "import", "clone", "synthetic"] {
+        assert!(root.get(flag).is_some(), "missing {flag}: {body}");
+    }
+    let text = body.to_string();
+    assert!(!text.contains(&app.root.to_string_lossy().to_string()), "{text}");
+}
+
+#[tokio::test]
+async fn browse_lists_root_relative_entries() {
+    let app = build(true, 1000).await;
+    let (status, body, _) = send(
+        &app.router,
+        "GET",
+        "/api/v1/discovery/roots/test-root/entries?path=",
+        LOOPBACK,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["root_id"], "test-root");
+    let names: Vec<&str> = body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap_or(""))
+        .collect();
+    assert!(names.contains(&"Cargo.toml"), "{names:?}");
+    assert!(names.contains(&"src"), "{names:?}");
+}
+
+#[tokio::test]
+async fn disabling_a_root_refuses_browse_and_moves_both_copies() {
+    let app = build(true, 1000).await;
+    let (status, body, _) = send(
+        &app.router,
+        "PATCH",
+        "/api/v1/discovery/roots/test-root",
+        LOOPBACK,
+        None,
+        Some(json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], false);
+
+    let (browse, body, _) = send(
+        &app.router,
+        "GET",
+        "/api/v1/discovery/roots/test-root/entries?path=",
+        LOOPBACK,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(browse, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, _, _) = send(
+        &app.router,
+        "PATCH",
+        "/api/v1/discovery/roots/test-root",
+        LOOPBACK,
+        None,
+        Some(json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn traversal_is_refused_by_discovery() {
+    let app = build(true, 1000).await;
+    let (status, body, _) = send(
+        &app.router,
+        "GET",
+        "/api/v1/discovery/roots/test-root/entries?path=..%2F..%2F..",
+        LOOPBACK,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        status == StatusCode::BAD_REQUEST || status == StatusCode::FORBIDDEN,
+        "{status} {body}"
+    );
+}
+
+#[tokio::test]
+async fn detect_returns_markers_for_a_rust_project() {
+    let app = build(true, 1000).await;
+    let (status, body, _) = send(
+        &app.router,
+        "POST",
+        "/api/v1/projects/detect",
+        LOOPBACK,
+        None,
+        Some(json!({ "root_id": "test-root", "relative_path": "" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let types: Vec<&str> = body["project_types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap_or(""))
+        .collect();
+    assert!(types.contains(&"rust"), "{types:?}");
+    assert_eq!(body["root_id"], "test-root");
+}
+
+#[tokio::test]
+async fn toggling_an_unknown_root_is_a_client_error() {
+    let app = build(true, 1000).await;
+    let (status, body, _) = send(
+        &app.router,
+        "PATCH",
+        "/api/v1/discovery/roots/nope",
+        LOOPBACK,
+        None,
+        Some(json!({ "enabled": false })),
+    )
+    .await;
+    assert!(
+        status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND,
+        "{status} {body}"
+    );
+}

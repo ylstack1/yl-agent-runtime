@@ -5,9 +5,10 @@
 //! `DiscoveryService` and `PolicyEngine`.
 
 pub mod device;
+pub mod discovery;
 pub mod ui;
 
-use axum::extract::State;
+use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -18,10 +19,34 @@ use runtime_core::error::Error as CoreError;
 use runtime_identity::IdentityServiceImpl;
 use runtime_workspace::discovery::DiscoveryService;
 use runtime_workspace::WorkspaceServiceImpl;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::sync::Arc;
 
 use crate::commands::AppState;
+
+/// JSON body extractor for API handlers. Axum's own rejection is plain text;
+/// the console expects `{"error": "..."}` for every failure, so map it here.
+pub struct ApiJson<T>(pub T);
+
+impl<T, S> FromRequest<S> for ApiJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => {
+                let status = rejection.status();
+                let message = rejection.body_text();
+                Err((status, Json(json!({ "error": message }))).into_response())
+            }
+        }
+    }
+}
 
 /// Facts about this runtime instance, shown in the console header.
 #[derive(Clone, Debug)]
@@ -49,7 +74,9 @@ pub struct ApiState {
 
 /// The API version prefix is applied by the caller (`nest("/api/v1", …)`).
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/device", get(device::get_device))
+    Router::new()
+        .route("/device", get(device::get_device))
+        .merge(discovery::routes())
 }
 
 /// Map a service error to an HTTP status and the `{"error": "..."}` body every
