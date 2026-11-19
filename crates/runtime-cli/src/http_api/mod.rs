@@ -8,21 +8,26 @@ pub mod device;
 pub mod discovery;
 pub mod ui;
 pub mod workspaces;
+pub mod approvals;
+pub mod devices;
 
 use axum::extract::{FromRequest, Request, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use runtime_approval::ApprovalBroker;
 use runtime_audit::AuditService;
+use runtime_core::audit::{AuditEvent, AuditEventType};
 use runtime_core::error::Error as CoreError;
-use runtime_identity::IdentityServiceImpl;
+use runtime_core::types::DeviceId;
+use runtime_identity::{IdentityService, IdentityServiceImpl};
 use runtime_workspace::discovery::DiscoveryService;
 use runtime_workspace::WorkspaceServiceImpl;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::sync::Arc;
+use tracing::warn;
 
 use crate::commands::AppState;
 
@@ -79,6 +84,8 @@ pub fn routes() -> Router<AppState> {
         .route("/device", get(device::get_device))
         .merge(discovery::routes())
         .merge(workspaces::routes())
+        .merge(approvals::routes())
+        .merge(devices::routes())
 }
 
 /// Map a service error to an HTTP status and the `{"error": "..."}` body every
@@ -102,6 +109,41 @@ pub fn api_error(err: &CoreError) -> (StatusCode, Json<serde_json::Value>) {
 /// Build the full backend error response for a service failure.
 pub fn error_response(err: &CoreError) -> Response {
     api_error(err).into_response()
+}
+
+/// Bearer token from the `Authorization` header, if present.
+pub(crate) fn api_bearer_token(req: &Request) -> Option<String> {
+    req.headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned)
+}
+
+/// Resolve the device id behind an authenticated session. Loopback peers
+/// present no token and map to `None` — they are the host itself.
+pub(crate) async fn session_device(req: &Request, api: &ApiState) -> Option<DeviceId> {
+    let token = api_bearer_token(req)?;
+    api.identity.validate_session(token).await.ok()
+}
+
+/// Best-effort audit record: never fails the request that triggered it.
+pub(crate) async fn audit_event(
+    api: &ApiState,
+    event_type: AuditEventType,
+    device_id: Option<DeviceId>,
+    resource: Option<String>,
+) {
+    let mut event = AuditEvent::new(event_type);
+    if let Some(device_id) = device_id {
+        event = event.with_device(device_id);
+    }
+    if let Some(resource) = resource {
+        event = event.with_resource(resource);
+    }
+    if let Err(e) = api.audit.record(event).await {
+        warn!("audit event {event_type:?} failed: {e}");
+    }
 }
 
 #[cfg(test)]

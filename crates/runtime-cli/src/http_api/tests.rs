@@ -15,10 +15,10 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use runtime_approval::ApprovalBrokerImpl;
+use runtime_approval::{ApprovalBroker, ApprovalBrokerImpl};
 use runtime_audit::{AuditService, AuditServiceImpl};
 use runtime_config::config::{DiscoveryConfig, DiscoveryRoot};
-use runtime_core::types::ExecutionProfile;
+use runtime_core::types::{AgentId, Capability, ExecutionProfile, ProjectId};
 use runtime_identity::{IdentityService, IdentityServiceImpl};
 use runtime_workspace::discovery::DiscoveryService;
 use runtime_workspace::{WorkspaceService, WorkspaceServiceImpl};
@@ -32,6 +32,8 @@ const REMOTE: &str = "192.168.1.50:50000";
 struct TestApp {
     router: Router,
     identity: Arc<IdentityServiceImpl>,
+    approvals: Arc<dyn ApprovalBroker>,
+    audit: Arc<dyn AuditService>,
     signing: SigningKey,
     root: PathBuf,
     _dir: TempDir,
@@ -83,9 +85,9 @@ async fn build(pairing_required: bool, rate_limit: u32) -> TestApp {
     let api_state = ApiState {
         fs,
         discovery,
-        approvals,
+        approvals: approvals.clone(),
         identity: identity.clone(),
-        audit,
+        audit: audit.clone(),
         facts: DeviceFacts {
             version: env!("CARGO_PKG_VERSION"),
             os: std::env::consts::OS,
@@ -107,6 +109,8 @@ async fn build(pairing_required: bool, rate_limit: u32) -> TestApp {
     TestApp {
         router: build_router(base_routes(), state),
         identity,
+        approvals,
+        audit,
         signing,
         root,
         _dir: dir,
@@ -699,4 +703,207 @@ async fn unknown_workspace_is_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+// ---- Task 7: approvals, devices, pairings, audit -------------------------
+
+#[tokio::test]
+async fn pending_approval_can_be_approved_then_disappears() {
+    let app = build(true, 1000).await;
+    let agent_id = AgentId::new();
+    let project_id = ProjectId::new();
+    let approval_id = app
+        .approvals
+        .request(
+            agent_id,
+            project_id,
+            Capability::ProcessExec,
+            Some("/workspace/src".into()),
+            "test approval".into(),
+        )
+        .await
+        .unwrap();
+
+    let (status, body, _) = send(
+        &app.router,
+        "GET",
+        "/api/v1/approvals",
+        LOOPBACK,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["approvals"].as_array().unwrap().len(), 1, "{body}");
+
+    let (status, body, _) = send(
+        &app.router,
+        "POST",
+        &format!("/api/v1/approvals/{approval_id}/approve"),
+        LOOPBACK,
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "approved", "{body}");
+
+    let (status, body, _) = send(
+        &app.router,
+        "GET",
+        "/api/v1/approvals",
+        LOOPBACK,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["approvals"].as_array().unwrap().len(), 0, "{body}");
+}
+
+#[tokio::test]
+async fn approve_and_reject_write_audit_events() {
+    let app = build(true, 1000).await;
+    let agent_id = AgentId::new();
+    let project_id = ProjectId::new();
+    let approval_id = app
+        .approvals
+        .request(
+            agent_id,
+            project_id,
+            Capability::ProcessExec,
+            None,
+            "test approval".into(),
+        )
+        .await
+        .unwrap();
+
+    let (status, _, _) = send(
+        &app.router,
+        "POST",
+        &format!("/api/v1/approvals/{approval_id}/approve"),
+        LOOPBACK,
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{status}");
+
+    let events = app
+        .audit
+        .query(runtime_core::audit::AuditFilter {
+            event_type: Some(runtime_core::audit::AuditEventType::ApprovalGranted),
+            agent_id: None,
+            device_id: None,
+            project_id: None,
+            session_id: None,
+            capability: None,
+            start_time: None,
+            end_time: None,
+            limit: None,
+            offset: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.resource.as_deref() == Some(&approval_id.to_string())),
+        "no approval grant audit event for {approval_id}: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn pairings_are_host_only() {
+    let app = build(true, 1000).await;
+    let token = app.token().await;
+
+    // A remote peer with a valid token passes require_session, then is
+    // rejected by the host-only check.
+    let (status, _, _) = send(
+        &app.router,
+        "GET",
+        "/api/v1/pairings",
+        REMOTE,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Loopback with a token is allowed.
+    let (status, body, _) = send(
+        &app.router,
+        "GET",
+        "/api/v1/pairings",
+        LOOPBACK,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("pairings").is_some(), "{body}");
+}
+
+#[tokio::test]
+async fn revoke_kills_the_session() {
+    let app = build(true, 1000).await;
+    let public_key = app.signing.verifying_key().to_bytes().to_vec();
+    let pairing = app
+        .identity
+        .request_pairing("test-device".into(), public_key)
+        .await
+        .unwrap();
+    let device_id = app
+        .identity
+        .approve_pairing(pairing.pairing_code)
+        .await
+        .unwrap();
+    let signature = app.signing.sign(device_id.to_string().as_bytes());
+    let token = app
+        .identity
+        .authenticate_device(device_id, hex(&signature.to_bytes()))
+        .await
+        .unwrap();
+
+    // Revoke via the API (loopback = host).
+    let (status, _, _) = send(
+        &app.router,
+        "POST",
+        &format!("/api/v1/devices/{device_id}/revoke"),
+        LOOPBACK,
+        Some(&token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{status}");
+
+    // Reuse the token from a REMOTE peer: require_session validates the token,
+    // and a revoked device must invalidate it (401).
+    let (status, _, _) = send(
+        &app.router,
+        "GET",
+        "/api/v1/device",
+        REMOTE,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{status}");
+}
+
+#[tokio::test]
+async fn malformed_approval_id_is_400() {
+    let app = build(true, 1000).await;
+    let (status, body, _) = send(
+        &app.router,
+        "POST",
+        "/api/v1/approvals/not-a-uuid/approve",
+        LOOPBACK,
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.get("error").is_some(), "{body}");
 }

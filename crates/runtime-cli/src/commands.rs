@@ -999,7 +999,7 @@ impl RateLimiter {
     }
 }
 
-fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
+pub(crate) fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
     use axum::response::IntoResponse;
     (
         status,
@@ -1008,7 +1008,7 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
         .into_response()
 }
 
-fn peer_ip(req: &Request) -> Option<IpAddr> {
+pub(crate) fn peer_ip(req: &Request) -> Option<IpAddr> {
     req.extensions()
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
         .map(|info| info.0.ip())
@@ -1016,7 +1016,7 @@ fn peer_ip(req: &Request) -> Option<IpAddr> {
 
 /// Only the host may approve or reject a pairing. Without connection info we
 /// cannot prove the peer is local, so we refuse.
-fn is_host_peer(ip: Option<IpAddr>) -> bool {
+pub(crate) fn is_host_peer(ip: Option<IpAddr>) -> bool {
     ip.map(|ip| ip.is_loopback()).unwrap_or(false)
 }
 
@@ -1031,7 +1031,7 @@ pub(crate) fn is_public_path(path: &str) -> bool {
         || path.starts_with("/ui/")
 }
 
-fn bearer_token(req: &Request) -> Option<String> {
+pub(crate) fn bearer_token(req: &Request) -> Option<String> {
     req.headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
