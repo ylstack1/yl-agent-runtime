@@ -7,6 +7,7 @@
 pub mod device;
 pub mod discovery;
 pub mod ui;
+pub mod workspaces;
 
 use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
@@ -77,6 +78,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/device", get(device::get_device))
         .merge(discovery::routes())
+        .merge(workspaces::routes())
 }
 
 /// Map a service error to an HTTP status and the `{"error": "..."}` body every

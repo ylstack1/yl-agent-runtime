@@ -19,6 +19,12 @@ impl ProjectId {
     pub fn nil() -> Self {
         Self(Uuid::nil())
     }
+
+    /// Parse a UUID string into a `ProjectId`. Returns `None` for malformed
+    /// input so HTTP/MCP layers can map it to a client error.
+    pub fn parse(input: &str) -> Option<Self> {
+        Uuid::parse_str(input).ok().map(Self)
+    }
 }
 
 impl Default for ProjectId {

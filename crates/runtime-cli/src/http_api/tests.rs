@@ -522,3 +522,181 @@ async fn toggling_an_unknown_root_is_a_client_error() {
         "{status} {body}"
     );
 }
+
+// ---- Task 6: workspaces --------------------------------------------------
+
+fn workspace_ids(body: &Value) -> Vec<String> {
+    body["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["id"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn register_then_list_then_unregister_keeps_files() {
+    let app = build(true, 1000).await;
+    let (status, body, _) = send(
+        &app.router,
+        "POST",
+        "/api/v1/workspaces/register",
+        LOOPBACK,
+        None,
+        Some(json!({ "root_id": "test-root", "relative_path": "src" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["workspace_id"].as_str().unwrap().to_string();
+    assert_eq!(body["already_registered"], false);
+    assert_eq!(body["available_to_agents_after_restart"], true);
+
+    let (status, list, _) =
+        send(&app.router, "GET", "/api/v1/workspaces", LOOPBACK, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert!(workspace_ids(&list).contains(&id), "{list}");
+
+    let (status, body, _) = send(
+        &app.router,
+        "DELETE",
+        &format!("/api/v1/workspaces/{id}"),
+        LOOPBACK,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "unregistered");
+
+    let (_, list, _) =
+        send(&app.router, "GET", "/api/v1/workspaces", LOOPBACK, None, None).await;
+    assert!(!workspace_ids(&list).contains(&id), "{list}");
+    assert!(app.root.join("src").exists(), "unregister deleted files");
+}
+
+#[tokio::test]
+async fn duplicate_register_reuses_the_id() {
+    let app = build(true, 1000).await;
+    let payload = json!({ "root_id": "test-root", "relative_path": "src" });
+    let (_, first, _) = send(
+        &app.router,
+        "POST",
+        "/api/v1/workspaces/register",
+        LOOPBACK,
+        None,
+        Some(payload.clone()),
+    )
+    .await;
+    let (status, second, _) = send(
+        &app.router,
+        "POST",
+        "/api/v1/workspaces/register",
+        LOOPBACK,
+        None,
+        Some(payload),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(first["workspace_id"], second["workspace_id"]);
+    assert_eq!(second["already_registered"], true);
+
+    let (_, list, _) =
+        send(&app.router, "GET", "/api/v1/workspaces", LOOPBACK, None, None).await;
+    let id = second["workspace_id"].as_str().unwrap();
+    let count = workspace_ids(&list).iter().filter(|w| *w == id).count();
+    assert_eq!(count, 1, "{list}");
+}
+
+#[tokio::test]
+async fn register_outside_any_root_is_refused() {
+    let app = build(true, 1000).await;
+    for relative in ["..%2F..%2Foutside", "%2FC%3A%2FWindows"] {
+        let (status, body, _) = send(
+            &app.router,
+            "POST",
+            "/api/v1/workspaces/register",
+            LOOPBACK,
+            None,
+            Some(json!({ "root_id": "test-root", "relative_path": relative })),
+        )
+        .await;
+        assert!(
+            status == StatusCode::BAD_REQUEST || status == StatusCode::FORBIDDEN,
+            "{relative}: {status} {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_body_has_relative_paths_only() {
+    let app = build(true, 1000).await;
+    let (_, body, _) =
+        send(&app.router, "GET", "/api/v1/workspaces", LOOPBACK, None, None).await;
+    let workspaces = body["workspaces"].as_array().unwrap();
+    assert!(!workspaces.is_empty(), "{body}");
+    for workspace in workspaces {
+        assert!(workspace.get("root").is_none(), "absolute root leaked: {body}");
+        assert!(workspace.get("root_id").is_some(), "{body}");
+        assert!(workspace.get("relative_path").is_some(), "{body}");
+    }
+    let text = body.to_string();
+    let canonical = app.root.canonicalize().unwrap();
+    for needle in [
+        app.root.to_string_lossy().to_string(),
+        canonical.to_string_lossy().to_string(),
+        canonical.to_string_lossy().replace('\\', "\\\\"),
+    ] {
+        assert!(!text.contains(&needle), "path leaked: {needle} in {text}");
+    }
+}
+
+#[tokio::test]
+async fn create_makes_the_directory_and_registers_it() {
+    let app = build(true, 1000).await;
+    let (status, body, _) = send(
+        &app.router,
+        "POST",
+        "/api/v1/workspaces/create",
+        LOOPBACK,
+        None,
+        Some(json!({
+            "root_id": "test-root",
+            "relative_path": "",
+            "name": "fresh-project",
+            "subdirs": ["src", "docs"],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["workspace_id"].as_str().unwrap().to_string();
+    assert!(app.root.join("fresh-project").is_dir());
+    assert!(app.root.join("fresh-project").join("src").is_dir());
+
+    let (_, one, _) = send(
+        &app.router,
+        "GET",
+        &format!("/api/v1/workspaces/{id}"),
+        LOOPBACK,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(one["id"], id.as_str());
+    assert_eq!(one["relative_path"], "fresh-project");
+    assert_eq!(one["root_id"], "test-root");
+}
+
+#[tokio::test]
+async fn unknown_workspace_is_404() {
+    let app = build(true, 1000).await;
+    let (status, body, _) = send(
+        &app.router,
+        "GET",
+        "/api/v1/workspaces/00000000-0000-0000-0000-000000000000",
+        LOOPBACK,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}

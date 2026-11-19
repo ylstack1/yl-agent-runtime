@@ -405,6 +405,12 @@ impl WorkspaceService for WorkspaceServiceImpl {
         // `validate_access` calls) are not rejected as UNC paths.
         let canonical = clean_verbatim_prefix(&canonical);
 
+        // Registering the same directory twice must reuse the existing id.
+        // This also makes startup registration idempotent across restarts.
+        if let Some(existing) = self.find_by_root(&canonical) {
+            return Ok(existing);
+        }
+
         let workspace = RegisteredWorkspace {
             id,
             root: canonical.clone(),
@@ -833,6 +839,30 @@ impl WorkspaceServiceImpl {
             .collect()
     }
 
+    /// Look up a registered workspace whose root is `path` (canonical or not;
+    /// verbatim prefixes and, on Windows, case are ignored). Used to keep
+    /// registration idempotent and to report `already_registered` in the API.
+    ///
+    /// Registries written by builds that minted a new id per startup can hold
+    /// several rows for one directory. The earliest registration wins, with the
+    /// id as tie-break, so the answer is stable across restarts instead of
+    /// depending on `HashMap` iteration order.
+    pub fn find_by_root(&self, path: &Path) -> Option<ProjectId> {
+        // Normalize the probe the same way `register` normalizes what it
+        // stores, so `foo`, `foo/.` and `\\?\C:\foo` all match. A path that
+        // cannot be canonicalized (e.g. deleted) falls back to raw comparison.
+        let probe = path
+            .canonicalize()
+            .map(|canonical| clean_verbatim_prefix(&canonical))
+            .unwrap_or_else(|_| path.to_path_buf());
+        let workspaces = self.workspaces.read().unwrap();
+        workspaces
+            .values()
+            .filter(|workspace| same_path(&workspace.root, &probe))
+            .min_by_key(|workspace| (workspace.registered_at, workspace.id.0))
+            .map(|workspace| workspace.id)
+    }
+
     /// Look up a registered workspace by ID (public for CLI/MCP consumers).
     pub fn get_workspace(&self, project_id: ProjectId) -> Result<RegisteredWorkspace> {
         let workspaces = self.workspaces.read().unwrap();
@@ -1203,6 +1233,18 @@ fn clean_verbatim_prefix(root: &Path) -> PathBuf {
         PathBuf::from(rest)
     } else {
         root.to_path_buf()
+    }
+}
+
+/// Compare two host paths the way the platform does: verbatim prefixes are
+/// stripped first, and Windows comparison is case-insensitive.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let a = clean_verbatim_prefix(a);
+    let b = clean_verbatim_prefix(b);
+    if cfg!(windows) {
+        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    } else {
+        a == b
     }
 }
 
@@ -2037,5 +2079,88 @@ diff --git a/b.txt b/b.txt
         service.set_discovery_root_enabled("r", false).unwrap();
         assert!(!service.discovery_config().roots[0].enabled);
         assert!(service.set_discovery_root_enabled("missing", false).is_err());
+    }
+
+    #[tokio::test]
+    async fn register_is_idempotent_for_the_same_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = DiscoveryConfig {
+            roots: vec![runtime_config::config::DiscoveryRoot {
+                id: "r".to_string(),
+                label: "R".to_string(),
+                path: root.clone(),
+                enabled: true,
+                browse: true,
+                create: true,
+                register: true,
+                import: false,
+                clone: false,
+                synthetic: false,
+            }],
+            ..Default::default()
+        };
+        let service =
+            WorkspaceServiceImpl::with_data_dir(dir.path().join("data"), config).unwrap();
+        let first = service
+            .register(root.clone(), ExecutionProfile::Development)
+            .await
+            .unwrap();
+        // Same directory, different spelling of the path.
+        let second = service
+            .register(
+                root.join("."),
+                ExecutionProfile::Development,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(service.list_workspaces().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn find_by_root_is_stable_when_the_registry_holds_duplicates() {
+        // Registries written before registration became idempotent can hold
+        // several rows for one directory. The earliest must win irrespective of
+        // insertion order, otherwise the id an agent sees changes per restart.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = DiscoveryConfig {
+            roots: vec![runtime_config::config::DiscoveryRoot {
+                id: "r".to_string(),
+                label: "R".to_string(),
+                path: root.clone(),
+                enabled: true,
+                browse: true,
+                create: true,
+                register: true,
+                import: false,
+                clone: false,
+                synthetic: false,
+            }],
+            ..Default::default()
+        };
+        let service =
+            WorkspaceServiceImpl::with_data_dir(dir.path().join("data"), config).unwrap();
+        let earliest = service
+            .register(root.clone(), ExecutionProfile::Development)
+            .await
+            .unwrap();
+
+        let mut duplicate = service.get_workspace(earliest).unwrap();
+        duplicate.id = ProjectId::new();
+        duplicate.registered_at = duplicate.registered_at + chrono::Duration::seconds(30);
+        service
+            .workspaces
+            .write()
+            .unwrap()
+            .insert(duplicate.id, duplicate.clone());
+
+        assert_eq!(service.list_workspaces().len(), 2);
+        assert_eq!(service.find_by_root(&root), Some(earliest));
+        // A different spelling of the same directory resolves to the same id.
+        assert_eq!(service.find_by_root(&root.join(".")), Some(earliest));
     }
 }
