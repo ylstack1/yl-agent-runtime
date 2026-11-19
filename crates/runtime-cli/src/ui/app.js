@@ -15,6 +15,7 @@ const state = {
   facts: null,
   pane: "roots",
   browse: { rootId: "", path: "" },
+  manageWorkspaceId: null,
   poll: { approvals: 0, devices: 0 },
 };
 
@@ -259,6 +260,7 @@ async function showPane(name) {
     if (name === "workspaces") await renderWorkspaces();
     if (name === "approvals") await renderApprovals();
     if (name === "devices") await renderDevices();
+    if (name === "manage") await renderWorkspaceManage();
   } catch (error) {
     toast(error.message, true);
   }
@@ -386,9 +388,16 @@ async function renderWorkspaces() {
       <div class="meta"><code>${esc(workspace.root_id ?? "?")}/${esc(workspace.relative_path ?? "")}</code></div>
       <div class="meta"><span>registered ${esc(workspace.registered_at)}</span></div>
       <div class="actions">
+        <button class="secondary" data-manage="${esc(workspace.id)}">Manage</button>
         <button class="danger" data-unregister="${esc(workspace.id)}">Unregister</button>
       </div>
     </div>`).join("");
+  for (const button of list.querySelectorAll("[data-manage]")) {
+    button.addEventListener("click", () => {
+      state.manageWorkspaceId = button.dataset.manage;
+      showPane("manage");
+    });
+  }
   for (const button of list.querySelectorAll("[data-unregister]")) {
     button.addEventListener("click", async () => {
       if (!confirm("Unregister this workspace? Files are never deleted.")) return;
@@ -401,6 +410,116 @@ async function renderWorkspaces() {
       }
     });
   }
+}
+
+async function renderWorkspaceManage() {
+  const id = state.manageWorkspaceId;
+  if (!id) {
+    showPane("workspaces");
+    return;
+  }
+  let workspace;
+  try {
+    workspace = await api(`/workspaces/${encodeURIComponent(id)}`);
+  } catch (error) {
+    toast(error.message, true);
+    showPane("workspaces");
+    return;
+  }
+  $("manage-breadcrumb").textContent = `${esc(workspace.display_name)} · ${esc(workspace.root_id ?? "?")}/${esc(workspace.relative_path ?? "")}`;
+  $("manage-display-name").value = workspace.display_name || "";
+  $("manage-profile").value = workspace.profile || "development";
+
+  // Settings
+  let settings;
+  try {
+    settings = await api(`/workspaces/${encodeURIComponent(id)}/settings`);
+  } catch (error) {
+    settings = { allow: [], deny: [], framework: null, toolchain: null };
+  }
+  $("manage-framework").value = settings.framework || "";
+  $("manage-toolchain").value = settings.toolchain || "";
+  $("manage-allow").value = Array.isArray(settings.allow) ? settings.allow.join(", ") : "";
+  $("manage-deny").value = Array.isArray(settings.deny) ? settings.deny.join(", ") : "";
+
+  // Devices
+  let devices;
+  try {
+    devices = await api(`/workspaces/${encodeURIComponent(id)}/devices`);
+  } catch (error) {
+    devices = { device_ids: [] };
+  }
+  const deviceList = $("manage-devices");
+  const ids = Array.isArray(devices.device_ids) ? devices.device_ids : [];
+  if (!ids.length) {
+    deviceList.innerHTML = `<div class="empty">No devices bound to this workspace.</div>`;
+  } else {
+    deviceList.innerHTML = ids.map((did) => `
+      <div class="card">
+        <div class="title"><code>${esc(did)}</code></div>
+        <div class="actions">
+          <button class="danger" data-unbind="${esc(did)}">Unbind</button>
+        </div>
+      </div>`).join("");
+    for (const button of deviceList.querySelectorAll("[data-unbind]")) {
+      button.addEventListener("click", async () => {
+        try {
+          await api(`/workspaces/${encodeURIComponent(id)}/devices/${encodeURIComponent(button.dataset.unbind)}`, { method: "DELETE" });
+          toast("Device unbound");
+          await renderWorkspaceManage();
+        } catch (error) {
+          toast(error.message, true);
+        }
+      });
+    }
+  }
+
+  // Form submit
+  $("manage-settings-form").onsubmit = async (event) => {
+    event.preventDefault();
+    const allow = $("manage-allow").value.split(",").map((s) => s.trim()).filter(Boolean);
+    const deny = $("manage-deny").value.split(",").map((s) => s.trim()).filter(Boolean);
+    try {
+      await api(`/workspaces/${encodeURIComponent(id)}/settings`, {
+        method: "PATCH",
+        body: {
+          allow,
+          deny,
+          framework: $("manage-framework").value || null,
+          toolchain: $("manage-toolchain").value || null,
+        },
+      });
+      toast("Settings saved");
+    } catch (error) {
+      toast(error.message, true);
+    }
+  };
+
+  $("manage-bind-btn").onclick = async () => {
+    const deviceId = $("manage-bind-device").value.trim();
+    if (!deviceId) return;
+    try {
+      await api(`/workspaces/${encodeURIComponent(id)}/devices/${encodeURIComponent(deviceId)}`, { method: "POST", body: {} });
+      toast("Device bound");
+      $("manage-bind-device").value = "";
+      await renderWorkspaceManage();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  };
+
+  $("manage-unregister").onclick = async () => {
+    if (!confirm("Unregister this workspace? Files are never deleted.")) return;
+    try {
+      await api(`/workspaces/${encodeURIComponent(id)}`, { method: "DELETE" });
+      toast("Workspace unregistered");
+      state.manageWorkspaceId = null;
+      await renderWorkspaces();
+      showPane("workspaces");
+    } catch (error) {
+      toast(error.message, true);
+    }
+  };
 }
 
 async function renderApprovals() {
@@ -560,6 +679,42 @@ async function createHere() {
   }
 }
 
+async function newWorkspace() {
+  const name = prompt("New workspace name");
+  if (!name) return;
+  try {
+    const result = await api("/workspaces/create", {
+      method: "POST",
+      body: { root_id: "", relative_path: "", name, profile: "development" },
+    });
+    toast("Workspace created");
+    await renderWorkspaces();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function cloneWorkspace() {
+  const gitUrl = prompt("Git repository URL to clone");
+  if (!gitUrl) return;
+  const into = prompt("Clone into subdirectory name (leave empty for auto)");
+  try {
+    const result = await api("/workspaces/register", {
+      method: "POST",
+      body: { root_id: "", relative_path: "", name: gitUrl.split("/").pop().replace(".git", ""), profile: "development" },
+    });
+    const wsId = result.workspace_id;
+    await api(`/workspaces/${encodeURIComponent(wsId)}/clone`, {
+      method: "POST",
+      body: { git_url: gitUrl, into_subdir: into || "" },
+    });
+    toast("Workspace cloned");
+    await renderWorkspaces();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 // ---- boot ---------------------------------------------------------------
 
 async function boot() {
@@ -598,6 +753,29 @@ function wire() {
   $("register-here").addEventListener("click", registerHere);
   $("detect-project").addEventListener("click", detectHere);
   $("create-here").addEventListener("click", createHere);
+  $("new-workspace").addEventListener("click", newWorkspace);
+  $("clone-workspace").addEventListener("click", cloneWorkspace);
+  $("manage-back").addEventListener("click", () => {
+    state.manageWorkspaceId = null;
+    showPane("workspaces");
+  });
+  $("manage-clone").addEventListener("click", async () => {
+    const id = state.manageWorkspaceId;
+    if (!id) return;
+    const gitUrl = prompt("Git repository URL to clone");
+    if (!gitUrl) return;
+    const into = prompt("Clone into subdirectory name (leave empty for auto)");
+    try {
+      await api(`/workspaces/${encodeURIComponent(id)}/clone`, {
+        method: "POST",
+        body: { git_url: gitUrl, into_subdir: into || "" },
+      });
+      toast("Workspace cloned");
+      await renderWorkspaceManage();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
 
   for (const button of document.querySelectorAll("#tabs button")) {
     button.addEventListener("click", () => showPane(button.dataset.pane));

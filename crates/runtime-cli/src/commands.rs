@@ -21,7 +21,9 @@ use runtime_toolchain::ToolchainDiscovery;
 use runtime_undo::UndoJournal;
 use runtime_workspace::{
     discovery::DiscoveryService, SensitiveMatcher, WorkspaceService, WorkspaceServiceImpl,
+    service::WorkspaceSettings,
 };
+use serde_json::{json, Value};
 use crate::tls::{self, TlsMaterial};
 use runtime_config::config::{TlsMode};
 use std::collections::HashMap;
@@ -1542,6 +1544,63 @@ pub enum WorkspaceAction {
         #[arg(help = "Name of the new project directory")]
         name: String,
     },
+    /// Edit a workspace's display name, profile, or tags.
+    Edit {
+        #[arg(help = "Workspace id")]
+        id: String,
+        #[arg(long, help = "New display name")]
+        name: Option<String>,
+        #[arg(long, help = "Execution profile (development, inspect, edit, sandboxed-development, elevated-one-shot)")]
+        profile: Option<String>,
+        #[arg(long, help = "Tag (repeatable)")]
+        tags: Option<Vec<String>>,
+    },
+    /// Clone a git repository into a workspace path and register it.
+    Clone {
+        #[arg(help = "Workspace id to clone into")]
+        id: String,
+        #[arg(long, help = "Git repository URL to clone")]
+        git_url: String,
+        #[arg(long, help = "Subdirectory under the workspace root to clone into")]
+        into: Option<String>,
+    },
+    /// List, bind, or unbind devices for a workspace.
+    Devices {
+        #[arg(help = "Workspace id")]
+        id: String,
+        #[command(subcommand)]
+        action: WorkspaceDeviceAction,
+    },
+    /// Get or set per-workspace settings (permissions, framework, toolchain).
+    Settings {
+        #[arg(help = "Workspace id")]
+        id: String,
+        #[arg(long, help = "Allowed capability prefix (repeatable)")]
+        allow: Option<Vec<String>>,
+        #[arg(long, help = "Denied capability prefix (repeatable)")]
+        deny: Option<Vec<String>>,
+        #[arg(long, help = "Framework hint (e.g. rust, node, python)")]
+        framework: Option<String>,
+        #[arg(long, help = "Toolchain hint (e.g. stable, 18, 3.11)")]
+        toolchain: Option<String>,
+    },
+}
+
+/// Device binding actions for a workspace.
+#[derive(clap::Subcommand, Debug)]
+pub enum WorkspaceDeviceAction {
+    /// List devices bound to a workspace.
+    List,
+    /// Bind a device to a workspace.
+    Bind {
+        #[arg(help = "Device id")]
+        device_id: String,
+    },
+    /// Unbind a device from a workspace.
+    Unbind {
+        #[arg(help = "Device id")]
+        device_id: String,
+    },
 }
 
 /// Workspace registry commands: list, register, unregister, create.
@@ -1628,6 +1687,102 @@ pub async fn run_workspace(action: WorkspaceAction) -> Result<()> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
             println!("Created workspace {} at {}/{}", id, parent, name);
+        }
+        WorkspaceAction::Edit { id, name, profile, tags } => {
+            let mut body = serde_json::json!({});
+            if let Some(n) = name { body["display_name"] = json!(n); }
+            if let Some(p) = profile { body["profile"] = json!(p); }
+            if let Some(t) = tags { body["tags"] = json!(t); }
+            let value = host_api(
+                reqwest::Method::PATCH,
+                &format!("/api/v1/workspaces/{id}"),
+                Some(body),
+            )
+            .await?;
+            let id = value.get("id").and_then(|v| v.as_str()).unwrap_or(&id);
+            println!("Edited workspace {}", id);
+        }
+        WorkspaceAction::Clone { id, git_url, into } => {
+            let value = host_api(
+                reqwest::Method::POST,
+                "/api/v1/workspaces/{id}/clone",
+                Some(serde_json::json!({
+                    "git_url": git_url,
+                    "into_subdir": into.unwrap_or_default(),
+                })),
+            )
+            .await?;
+            let new_id = value.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let subdir = value.get("into_subdir").and_then(|v| v.as_str()).unwrap_or("");
+            println!("Cloned into workspace {} as subdir {}", new_id, subdir);
+        }
+        WorkspaceAction::Devices { id, action } => match action {
+            WorkspaceDeviceAction::List => {
+                let value = host_api(
+                    reqwest::Method::GET,
+                    &format!("/api/v1/workspaces/{id}/devices"),
+                    None,
+                )
+                .await?;
+                let device_ids = value
+                    .get("device_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                if device_ids.is_empty() {
+                    println!("No devices bound to workspace {id}.");
+                } else {
+                    println!("Devices bound to workspace {id}:");
+                    for d in device_ids {
+                        println!("  {d}");
+                    }
+                }
+            }
+            WorkspaceDeviceAction::Bind { device_id } => {
+                host_api(
+                    reqwest::Method::POST,
+                    &format!("/api/v1/workspaces/{id}/devices/{device_id}"),
+                    Some(serde_json::json!({})),
+                )
+                .await?;
+                println!("Bound device {device_id} to workspace {id}.");
+            }
+            WorkspaceDeviceAction::Unbind { device_id } => {
+                host_api(
+                    reqwest::Method::DELETE,
+                    &format!("/api/v1/workspaces/{id}/devices/{device_id}"),
+                    None,
+                )
+                .await?;
+                println!("Unbound device {device_id} from workspace {id}.");
+            }
+        },
+        WorkspaceAction::Settings { id, allow, deny, framework, toolchain } => {
+            // GET current settings first to merge.
+            let current_value: Value = host_api(
+                reqwest::Method::GET,
+                &format!("/api/v1/workspaces/{id}/settings"),
+                None,
+            )
+            .await?;
+            let current: WorkspaceSettings =
+                serde_json::from_value(current_value).map_err(|e| anyhow::anyhow!(e))?;
+            let mut settings = current;
+            if let Some(a) = allow { settings.allow = a; }
+            if let Some(d) = deny { settings.deny = d; }
+            if let Some(f) = framework { settings.framework = Some(f); }
+            if let Some(t) = toolchain { settings.toolchain = Some(t); }
+            let value = host_api(
+                reqwest::Method::PATCH,
+                &format!("/api/v1/workspaces/{id}/settings"),
+                Some(serde_json::to_value(&settings).unwrap()),
+            )
+            .await?;
+            println!("Settings for workspace {id}:");
+            println!("  allow: {:?}", value.get("allow").and_then(|v| v.as_array()));
+            println!("  deny: {:?}", value.get("deny").and_then(|v| v.as_array()));
+            println!("  framework: {:?}", value.get("framework").and_then(|v| v.as_str()));
+            println!("  toolchain: {:?}", value.get("toolchain").and_then(|v| v.as_str()));
         }
     }
     Ok(())

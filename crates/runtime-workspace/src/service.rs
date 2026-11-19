@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, RwLock};
 
 /// Origin of a workspace record: how the workspace came to be registered.
@@ -72,6 +73,32 @@ pub struct RegisteredWorkspace {
     pub deny_paths: Vec<PathBuf>,
 }
 
+/// Per-workspace settings stored as a sidecar JSON file (one per workspace id).
+/// These are display/preference settings managed through the console or CLI;
+/// enforcement inside MCP tools is a separate concern.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkspaceSettings {
+    /// Allowed capability prefixes (e.g. "workspace.read", "process.exec").
+    /// Empty means "allow all that the profile permits".
+    pub allow: Vec<String>,
+    /// Denied capability prefixes (e.g. "process.exec", "network.direct").
+    /// Deny takes precedence over allow.
+    pub deny: Vec<String>,
+    /// Preferred framework hint (e.g. "rust", "node", "python", "dotnet").
+    pub framework: Option<String>,
+    /// Preferred toolchain hint (e.g. "stable", "18", "3.11", "8").
+    pub toolchain: Option<String>,
+    /// Free-form extra settings the console/CLI may store.
+    pub other: serde_json::Value,
+}
+
+/// Device bindings persisted per workspace: which device ids are bound to
+/// which workspace. Stored as `<data_dir>/workspace_devices/{id}.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkspaceDeviceBindings {
+    pub device_ids: Vec<runtime_core::types::DeviceId>,
+}
+
 /// Workspace service implementation
 #[derive(Clone)]
 pub struct WorkspaceServiceImpl {
@@ -83,6 +110,10 @@ pub struct WorkspaceServiceImpl {
     data_dir: Option<PathBuf>,
     /// Path to the workspace registry JSONL file.
     registry_path: Option<PathBuf>,
+    /// Directory for per-workspace settings sidecar files.
+    settings_dir: Option<PathBuf>,
+    /// Directory for per-workspace device binding sidecar files.
+    devices_dir: Option<PathBuf>,
     /// Discovery config (root enablement + per-op flags). Used to enforce
     /// that register/create only happen on roots that allow it.
     discovery: Arc<RwLock<DiscoveryConfig>>,
@@ -97,6 +128,8 @@ impl WorkspaceServiceImpl {
             sensitive: Arc::new(RwLock::new(SensitiveMatcher::new())),
             data_dir: None,
             registry_path: None,
+            settings_dir: None,
+            devices_dir: None,
             discovery: Arc::new(RwLock::new(DiscoveryConfig::default())),
         }
     }
@@ -118,6 +151,14 @@ impl WorkspaceServiceImpl {
             Error::Config(format!("Cannot create data dir {data_dir:?}: {e}"))
         })?;
         let registry_path = data_dir.join("workspaces.jsonl");
+        let settings_dir = data_dir.join("workspace_settings");
+        let devices_dir = data_dir.join("workspace_devices");
+        std::fs::create_dir_all(&settings_dir).map_err(|e| {
+            Error::Config(format!("Cannot create workspace settings dir {settings_dir:?}: {e}"))
+        })?;
+        std::fs::create_dir_all(&devices_dir).map_err(|e| {
+            Error::Config(format!("Cannot create workspace devices dir {devices_dir:?}: {e}"))
+        })?;
 
         let workspaces = Arc::new(RwLock::new(HashMap::new()));
         let validators = Arc::new(RwLock::new(HashMap::new()));
@@ -127,6 +168,8 @@ impl WorkspaceServiceImpl {
             sensitive: Arc::new(RwLock::new(SensitiveMatcher::new())),
             data_dir: Some(data_dir),
             registry_path: Some(registry_path.clone()),
+            settings_dir: Some(settings_dir),
+            devices_dir: Some(devices_dir),
             discovery: Arc::new(RwLock::new(discovery)),
         };
 
@@ -872,6 +915,20 @@ impl WorkspaceServiceImpl {
             .ok_or_else(|| Error::WorkspaceNotFound(format!("Project {}", project_id)))
     }
 
+    /// Replace the stored record for an existing workspace and persist.
+    pub fn update_workspace(&self, project_id: ProjectId, workspace: RegisteredWorkspace) -> Result<()> {
+        let mut workspaces = self.workspaces.write().unwrap();
+        if !workspaces.contains_key(&project_id) {
+            return Err(Error::WorkspaceNotFound(format!("Project {}", project_id)));
+        }
+        workspaces.insert(project_id, workspace);
+        drop(workspaces);
+        if self.registry_path.is_some() {
+            self.persist_registry()?;
+        }
+        Ok(())
+    }
+
     /// Create a new empty project directory under `parent_path`, register it,
     /// and return its opaque ID. Never overwrites an existing destination.
     ///
@@ -980,6 +1037,191 @@ impl WorkspaceServiceImpl {
         }
 
         self.workspaces.write().unwrap().insert(id, workspace.clone());
+        self.validators.write().unwrap().insert(id, validator);
+
+        if self.registry_path.is_some() {
+            self.persist_registry()?;
+        }
+
+        Ok(id)
+    }
+
+    /// Per-workspace settings sidecar path.
+    fn settings_path(&self, project_id: &ProjectId) -> PathBuf {
+        self.settings_dir
+            .as_ref()
+            .expect("settings dir not configured")
+            .join(format!("{}.json", project_id))
+    }
+
+    /// Per-workspace device bindings sidecar path.
+    fn devices_path(&self, project_id: &ProjectId) -> PathBuf {
+        self.devices_dir
+            .as_ref()
+            .expect("devices dir not configured")
+            .join(format!("{}.json", project_id))
+    }
+
+    /// Read the settings sidecar for a workspace (defaults if missing).
+    pub fn get_workspace_settings(&self, project_id: &ProjectId) -> Result<WorkspaceSettings> {
+        let path = self.settings_path(project_id);
+        if !path.exists() {
+            return Ok(WorkspaceSettings::default());
+        }
+        let contents = std::fs::read_to_string(&path).map_err(|e| {
+            Error::Config(format!("Cannot read workspace settings {path:?}: {e}"))
+        })?;
+        serde_json::from_str(&contents).map_err(|e| {
+            Error::Config(format!("Invalid workspace settings {path:?}: {e}"))
+        })
+    }
+
+    /// Write the settings sidecar for a workspace.
+    pub fn set_workspace_settings(
+        &self,
+        project_id: &ProjectId,
+        settings: &WorkspaceSettings,
+    ) -> Result<()> {
+        let path = self.settings_path(project_id);
+        let contents = serde_json::to_string_pretty(settings).map_err(|e| {
+            Error::Config(format!("Cannot serialize workspace settings: {e}"))
+        })?;
+        std::fs::write(&path, contents).map_err(|e| {
+            Error::Config(format!("Cannot write workspace settings {path:?}: {e}"))
+        })?;
+        Ok(())
+    }
+
+    /// List device ids bound to a workspace.
+    pub fn list_workspace_devices(&self, project_id: &ProjectId) -> Result<Vec<DeviceId>> {
+        let path = self.devices_path(project_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let contents = std::fs::read_to_string(&path).map_err(|e| {
+            Error::Config(format!("Cannot read workspace device bindings {path:?}: {e}"))
+        })?;
+        let bindings: WorkspaceDeviceBindings =
+            serde_json::from_str(&contents).map_err(|e| {
+                Error::Config(format!("Invalid workspace device bindings {path:?}: {e}"))
+            })?;
+        Ok(bindings.device_ids)
+    }
+
+    /// Bind a device to a workspace (idempotent).
+    pub fn bind_device_to_workspace(
+        &self,
+        project_id: &ProjectId,
+        device_id: DeviceId,
+    ) -> Result<()> {
+        let path = self.devices_path(project_id);
+        let mut bindings: WorkspaceDeviceBindings = if path.exists() {
+            let contents = std::fs::read_to_string(&path).map_err(|e| {
+                Error::Config(format!("Cannot read workspace device bindings {path:?}: {e}"))
+            })?;
+            serde_json::from_str(&contents).map_err(|e| {
+                Error::Config(format!("Invalid workspace device bindings {path:?}: {e}"))
+            })?
+        } else {
+            WorkspaceDeviceBindings::default()
+        };
+        if !bindings.device_ids.contains(&device_id) {
+            bindings.device_ids.push(device_id);
+            let contents = serde_json::to_string(&bindings).map_err(|e| {
+                Error::Config(format!("Cannot serialize device bindings: {e}"))
+            })?;
+            std::fs::write(&path, contents).map_err(|e| {
+                Error::Config(format!("Cannot write device bindings {path:?}: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Unbind a device from a workspace.
+    pub fn unbind_device_from_workspace(
+        &self,
+        project_id: &ProjectId,
+        device_id: &DeviceId,
+    ) -> Result<()> {
+        let path = self.devices_path(project_id);
+        if !path.exists() {
+            return Ok(());
+        }
+        let contents = std::fs::read_to_string(&path).map_err(|e| {
+            Error::Config(format!("Cannot read workspace device bindings {path:?}: {e}"))
+        })?;
+        let mut bindings: WorkspaceDeviceBindings =
+            serde_json::from_str(&contents).map_err(|e| {
+                Error::Config(format!("Invalid workspace device bindings {path:?}: {e}"))
+            })?;
+        bindings.device_ids.retain(|d| d != device_id);
+        let contents = serde_json::to_string(&bindings).map_err(|e| {
+            Error::Config(format!("Cannot serialize device bindings: {e}"))
+        })?;
+        std::fs::write(&path, contents).map_err(|e| {
+            Error::Config(format!("Cannot write device bindings {path:?}: {e}"))
+        })?;
+        Ok(())
+    }
+
+    /// Clone a git repository into `<workspace root>/<into_subdir>`, then
+    /// register that directory as a new workspace (returns its new id).
+    /// The original `project_id` workspace is left untouched.
+    pub async fn clone_workspace(
+        &self,
+        project_id: &ProjectId,
+        git_url: &str,
+        into_subdir: &str,
+    ) -> Result<ProjectId> {
+        let workspace = self.get_workspace(*project_id)?;
+        let dest = workspace.root.join(into_subdir);
+        if dest.exists() {
+            return Err(Error::Validation(format!(
+                "Clone destination already exists: {:?}",
+                dest
+            )));
+        }
+        // Enforce discovery root `create` flag on the clone destination root.
+        self.check_discovery_root(&dest, "create")?;
+
+        // Run `git clone <url> <dest>`.
+        let status = std::process::Command::new("git")
+            .args(["clone", git_url, dest.to_str().ok_or_else(|| {
+                Error::Config("Clone destination path is not valid UTF-8".to_string())
+            })?])
+            .status()
+            .map_err(|e| {
+                Error::Process(format!("Failed to run git clone: {e}"))
+            })?;
+        if !status.success() {
+            return Err(Error::Process(format!(
+                "git clone failed with exit status {:?}",
+                status.code()
+            )));
+        }
+
+        let canonical = dest.canonicalize().map_err(|e| {
+            Error::Validation(format!("Cannot canonicalize cloned workspace root: {e}"))
+        })?;
+        let canonical = clean_verbatim_prefix(&canonical);
+
+        let id = ProjectId::new();
+        let workspace_record = RegisteredWorkspace {
+            id,
+            root: canonical.clone(),
+            display_name: into_subdir.to_string(),
+            profile: ExecutionProfile::Development,
+            origin: WorkspaceOrigin::Cloned,
+            registered_at: chrono::Utc::now(),
+            last_opened: None,
+            tags: Vec::new(),
+            max_file_size: 100_000_000,
+            deny_paths: Vec::new(),
+        };
+
+        let mut validator =
+            PathValidator::new().with_root(canonical.clone()).allow_symlinks(false);
+        self.workspaces.write().unwrap().insert(id, workspace_record.clone());
         self.validators.write().unwrap().insert(id, validator);
 
         if self.registry_path.is_some() {

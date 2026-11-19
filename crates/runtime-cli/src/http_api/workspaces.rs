@@ -7,7 +7,7 @@
 
 use axum::extract::{Path as UrlPath, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -15,9 +15,10 @@ use std::path::Path;
 
 use runtime_core::error::Error;
 use runtime_core::traits::WorkspaceService;
-use runtime_core::types::{ExecutionProfile, ProjectId};
+use runtime_core::types::{DeviceId, ExecutionProfile, ProjectId};
 use runtime_workspace::discovery::ConfiguredRoot;
-use runtime_workspace::service::RegisteredWorkspace;
+use runtime_workspace::service::{RegisteredWorkspace, WorkspaceSettings};
+use uuid::Uuid;
 
 use super::discovery::resolve_root_path;
 use super::{api_error, ApiJson, ApiState};
@@ -30,7 +31,17 @@ pub fn routes() -> Router<AppState> {
         .route("/workspaces/create", post(create))
         .route(
             "/workspaces/{id}",
-            get(get_one).delete(unregister),
+            get(get_one).patch(edit).delete(unregister),
+        )
+        .route("/workspaces/{id}/clone", post(clone))
+        .route(
+            "/workspaces/{id}/settings",
+            get(get_settings).patch(set_settings),
+        )
+        .route("/workspaces/{id}/devices", get(list_devices))
+        .route(
+            "/workspaces/{id}/devices/{device_id}",
+            post(bind_device).delete(unbind_device),
         )
 }
 
@@ -96,6 +107,7 @@ fn sanitize(workspace: &RegisteredWorkspace, roots: &[ConfiguredRoot]) -> Value 
         "registered_at": workspace.registered_at,
         "root_id": root_id,
         "relative_path": relative_path,
+        "tags": workspace.tags,
         // Console registrations are in the service registry but not in the
         // MCP server's startup snapshot; agents see them after a restart.
         "available_to_agents_after_restart": true,
@@ -228,6 +240,157 @@ async fn unregister(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -
     match api.fs.unregister(project_id).await {
         Ok(()) => Json(json!({ "workspace_id": project_id, "state": "unregistered" }))
             .into_response(),
+        Err(err) => api_error(&err).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct EditBody {
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
+async fn edit(State(api): State<ApiState>, UrlPath(id): UrlPath<String>, ApiJson(body): ApiJson<EditBody>) -> Response {
+    let project_id = match ProjectId::parse(&id) {
+        Some(project_id) => project_id,
+        None => return api_error(&Error::Validation("workspace id must be a UUID".into())).into_response(),
+    };
+    let mut workspace = match api.fs.get_workspace(project_id) {
+        Ok(w) => w,
+        Err(err) => return api_error(&err).into_response(),
+    };
+    if let Some(name) = body.display_name {
+        workspace.display_name = name;
+    }
+    if let Some(profile) = body.profile.and_then(|p| parse_profile(Some(p)).ok()) {
+        workspace.profile = profile;
+    }
+    if let Some(tags) = body.tags {
+        workspace.tags = tags;
+    }
+    // Persist the updated workspace record.
+    match api.fs.update_workspace(project_id, workspace.clone()) {
+        Ok(()) => {}
+        Err(err) => return api_error(&err).into_response(),
+    }
+    let roots = api.discovery.list_roots();
+    Json(sanitize(&workspace, &roots)).into_response()
+}
+
+#[derive(Deserialize)]
+struct CloneBody {
+    git_url: String,
+    #[serde(default)]
+    into_subdir: String,
+}
+
+async fn clone(State(api): State<ApiState>, UrlPath(id): UrlPath<String>, ApiJson(body): ApiJson<CloneBody>) -> Response {
+    let project_id = match ProjectId::parse(&id) {
+        Some(project_id) => project_id,
+        None => return api_error(&Error::Validation("workspace id must be a UUID".into())).into_response(),
+    };
+    let into_subdir = if body.into_subdir.is_empty() {
+        format!("clone-{}", &id.to_string()[..8])
+    } else {
+        body.into_subdir
+    };
+    match api.fs.clone_workspace(&project_id, &body.git_url, &into_subdir).await {
+        Ok(new_id) => Json(json!({
+            "workspace_id": new_id,
+            "state": "cloned",
+            "into_subdir": into_subdir,
+        }))
+        .into_response(),
+        Err(err) => api_error(&err).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SettingsBody {
+    #[serde(default)]
+    allow: Option<Vec<String>>,
+    #[serde(default)]
+    deny: Option<Vec<String>>,
+    #[serde(default)]
+    framework: Option<String>,
+    #[serde(default)]
+    toolchain: Option<String>,
+    #[serde(default)]
+    other: Option<serde_json::Value>,
+}
+
+async fn get_settings(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
+    let project_id = match ProjectId::parse(&id) {
+        Some(project_id) => project_id,
+        None => return api_error(&Error::Validation("workspace id must be a UUID".into())).into_response(),
+    };
+    match api.fs.get_workspace_settings(&project_id) {
+        Ok(settings) => Json(settings).into_response(),
+        Err(err) => api_error(&err).into_response(),
+    }
+}
+
+async fn set_settings(State(api): State<ApiState>, UrlPath(id): UrlPath<String>, ApiJson(body): ApiJson<SettingsBody>) -> Response {
+    let project_id = match ProjectId::parse(&id) {
+        Some(project_id) => project_id,
+        None => return api_error(&Error::Validation("workspace id must be a UUID".into())).into_response(),
+    };
+    let mut settings = match api.fs.get_workspace_settings(&project_id) {
+        Ok(s) => s,
+        Err(err) => return api_error(&err).into_response(),
+    };
+    if let Some(allow) = body.allow { settings.allow = allow; }
+    if let Some(deny) = body.deny { settings.deny = deny; }
+    if let Some(framework) = body.framework { settings.framework = Some(framework); }
+    if let Some(toolchain) = body.toolchain { settings.toolchain = Some(toolchain); }
+    if let Some(other) = body.other { settings.other = other; }
+    match api.fs.set_workspace_settings(&project_id, &settings) {
+        Ok(()) => Json(settings).into_response(),
+        Err(err) => api_error(&err).into_response(),
+    }
+}
+
+async fn list_devices(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
+    let project_id = match ProjectId::parse(&id) {
+        Some(project_id) => project_id,
+        None => return api_error(&Error::Validation("workspace id must be a UUID".into())).into_response(),
+    };
+    match api.fs.list_workspace_devices(&project_id) {
+        Ok(device_ids) => Json(json!({ "device_ids": device_ids })).into_response(),
+        Err(err) => api_error(&err).into_response(),
+    }
+}
+
+async fn bind_device(State(api): State<ApiState>, UrlPath((id, device_id)): UrlPath<(String, String)>) -> Response {
+    let project_id = match ProjectId::parse(&id) {
+        Some(project_id) => project_id,
+        None => return api_error(&Error::Validation("workspace id must be a UUID".into())).into_response(),
+    };
+    let device_uuid = match uuid::Uuid::parse_str(&device_id) {
+        Ok(u) => u,
+        Err(_) => return api_error(&Error::Validation("device id must be a UUID".into())).into_response(),
+    };
+    match api.fs.bind_device_to_workspace(&project_id, DeviceId(device_uuid)) {
+        Ok(()) => Json(json!({ "state": "bound" })).into_response(),
+        Err(err) => api_error(&err).into_response(),
+    }
+}
+
+async fn unbind_device(State(api): State<ApiState>, UrlPath((id, device_id)): UrlPath<(String, String)>) -> Response {
+    let project_id = match ProjectId::parse(&id) {
+        Some(project_id) => project_id,
+        None => return api_error(&Error::Validation("workspace id must be a UUID".into())).into_response(),
+    };
+    let device_uuid = match uuid::Uuid::parse_str(&device_id) {
+        Ok(u) => u,
+        Err(_) => return api_error(&Error::Validation("device id must be a UUID".into())).into_response(),
+    };
+    match api.fs.unbind_device_from_workspace(&project_id, &DeviceId(device_uuid)) {
+        Ok(()) => Json(json!({ "state": "unbound" })).into_response(),
         Err(err) => api_error(&err).into_response(),
     }
 }
