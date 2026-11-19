@@ -90,6 +90,7 @@ enum Commands {
 }
 
 mod commands;
+mod tls;
 
 use commands::{ApprovalAction, DevicesAction, DiscoveryAction, PairingAction, WorkspaceAction};
 

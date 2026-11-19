@@ -77,8 +77,19 @@ iroh = "1.4"
 axum = "0.8"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
+# TLS for the LAN listener (secure context for browser WebCrypto).
+# The `ring` provider is pinned: `aws-lc-rs` needs cmake/nasm on Windows.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+axum-server = { version = "0.9", features = ["tls-rustls-no-provider"] }
+rcgen = "0.14"
+if-addrs = "0.13"
+
 # HTTP client (for CLI approval commands talking to the running server)
 reqwest = { version = "0.12", features = ["json"] }
+
+# HTTP testing / middleware utilities
+tower = { version = "0.5", features = ["util"] }
 
 # IPC
 tokio-util = { version = "0.7", features = ["codec", "io"] }
