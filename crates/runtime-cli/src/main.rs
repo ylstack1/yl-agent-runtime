@@ -93,6 +93,7 @@ enum Commands {
 }
 
 mod commands;
+mod http_api;
 mod tls;
 
 use commands::{ApprovalAction, DevicesAction, DiscoveryAction, PairingAction, WorkspaceAction};

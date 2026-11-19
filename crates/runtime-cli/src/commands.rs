@@ -497,10 +497,17 @@ pub async fn run_mcp_server(opts: McpOptions) -> Result<()> {
     let policy_engine: Arc<dyn runtime_policy::PolicyEngine> =
         Arc::new(runtime_policy::PolicyEngineImpl::new());
 
-    // 4. Build the workspace service and register roots.
+    // 4. Build the workspace service and register roots. Discovery roots are
+    //    synthesized from these roots when `[discovery].roots` is empty, so
+    //    register/create/browse always have an enforced boundary.
+    let discovery_config = runtime_config::config::effective_discovery(
+        &config.discovery,
+        &roots,
+        &read_only_roots,
+    );
     let service = Arc::new(WorkspaceServiceImpl::with_data_dir(
         config.data_dir.clone(),
-        config.discovery.clone(),
+        discovery_config,
     )?);
     service.set_sensitive(SensitiveMatcher::new());
     let mut roots_pairs: Vec<(ProjectId, PathBuf)> = Vec::new();
@@ -665,10 +672,17 @@ pub async fn run_http_server(
     let policy_engine: Arc<dyn runtime_policy::PolicyEngine> =
         Arc::new(runtime_policy::PolicyEngineImpl::new());
 
-    // 4. Build the workspace service and register roots.
+    // 4. Build the workspace service and register roots. Discovery roots are
+    //    synthesized from these roots when `[discovery].roots` is empty, so
+    //    register/create/browse always have an enforced boundary.
+    let discovery_config = runtime_config::config::effective_discovery(
+        &config.discovery,
+        &roots,
+        &read_only_roots,
+    );
     let service = Arc::new(WorkspaceServiceImpl::with_data_dir(
         config.data_dir.clone(),
-        config.discovery.clone(),
+        discovery_config,
     )?);
     service.set_sensitive(SensitiveMatcher::new());
     let mut roots_pairs: Vec<(ProjectId, PathBuf)> = Vec::new();
@@ -699,6 +713,13 @@ pub async fn run_http_server(
         ));
     let process_service: Arc<dyn runtime_process::ProcessServiceOps> =
         Arc::new(runtime_process::ProcessService::new());
+
+    // Clone everything the HTTP API needs before McpServer takes ownership.
+    let api_fs = service.clone();
+    let api_audit = audit.clone();
+    let api_approvals = approval_broker.clone();
+    let discovery = Arc::new(DiscoveryService::from_config(service.discovery_config())?);
+
     let mcp_server = Arc::new(runtime_mcp::McpServer::new_for_fs(
         service,
         roots_pairs,
@@ -735,12 +756,6 @@ pub async fn run_http_server(
         );
     }
 
-    let app_state = AppState {
-        identity: identity.clone(),
-        pairing_required,
-        limiter: Arc::new(RateLimiter::new(rate_limit_per_minute)),
-    };
-
     // 7. Serve over Streamable HTTP.
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -771,53 +786,6 @@ pub async fn run_http_server(
         LocalSessionManager::default().into(),
         mcp_config,
     );
-
-    // Build the axum router: public health/pairing routes plus the MCP service
-    // mounted at /mcp. Every route passes through `require_session`.
-    let app = Router::new()
-        .route("/health", axum::routing::get(health))
-        .route("/pair/request", axum::routing::post(pair_request))
-        .route("/pair/status", axum::routing::get(pair_status))
-        .route(
-            "/pair/authenticate",
-            axum::routing::post(pair_authenticate),
-        )
-        .route("/pair/approve", axum::routing::post(pair_approve))
-        .route("/pair/reject", axum::routing::post(pair_reject))
-        .route("/pair/list", axum::routing::get(pair_list))
-        .route("/device/revoke", axum::routing::post(device_revoke))
-        .nest_service("/mcp", mcp_service);
-
-    // Permissive CORS. The Android client is a native HTTP client and does not
-    // enforce CORS at all; this exists for browser-based MCP clients and for
-    // browser preflight requests. `AllowOrigin::any()` cannot be combined with
-    // credentials, which we do not use.
-    let app = app.layer(
-        CorsLayer::new()
-            .allow_methods([Method::POST, Method::GET, Method::DELETE, Method::OPTIONS])
-            .allow_headers([
-                HeaderName::from_static("content-type"),
-                HeaderName::from_static("accept"),
-                HeaderName::from_static("authorization"),
-                HeaderName::from_static("mcp-session-id"),
-                HeaderName::from_static("mcp-protocol-version"),
-                HeaderName::from_static("last-event-id"),
-                HeaderName::from_static("origin"),
-            ])
-            .expose_headers([
-                HeaderName::from_static("mcp-session-id"),
-                HeaderName::from_static("mcp-protocol-version"),
-            ])
-            .allow_origin(AllowOrigin::any())
-            .allow_credentials(false),
-    );
-
-    let app = app
-        .layer(middleware::from_fn_with_state(
-            app_state.clone(),
-            require_session,
-        ))
-        .with_state(app_state);
 
     // 8. Transport plan: loopback stays plain (local MCP clients keep working),
     //    every LAN address gets TLS so browsers have a secure context.
@@ -861,9 +829,40 @@ pub async fn run_http_server(
     if let Some(m) = &material {
         info!("Certificate SHA-256 fingerprint: {}", m.fingerprint);
     }
-    if tls_off && plan.lan_ips.iter().any(|_| true) && allow_remote {
-        warn!("TLS is off for LAN listeners: traffic is plaintext (explicitly allowed)");
-    }
+
+    // 9. Router: pairing/health/MCP (`base`) plus the authenticated API and the
+    //    console. One `build_router` call keeps the middleware order testable.
+    let api_state = crate::http_api::ApiState {
+        fs: api_fs,
+        discovery,
+        approvals: api_approvals,
+        identity: identity.clone(),
+        audit: api_audit,
+        facts: crate::http_api::DeviceFacts {
+            version: env!("CARGO_PKG_VERSION"),
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            yolo: config.policy.yolo,
+            pairing_required,
+            tls_enabled: !plan.tls.is_empty(),
+            cert_fingerprint: material.as_ref().map(|m| m.fingerprint.clone()),
+            lan_urls: plan
+                .tls
+                .iter()
+                .map(|addr| format!("https://{addr}/ui"))
+                .collect(),
+        },
+    };
+    let app_state = AppState {
+        identity,
+        pairing_required,
+        limiter: Arc::new(RateLimiter::new(rate_limit_per_minute)),
+        api: api_state,
+    };
+
+    let base: Router<AppState> = base_routes().nest_service("/mcp", mcp_service);
+
+    let app = build_router(base, app_state);
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for addr in &plan.plain {
@@ -944,23 +943,33 @@ async fn port_is_open(port: u16) -> bool {
 
 /// Shared state for the HTTP auth/pairing layer.
 #[derive(Clone)]
-struct AppState {
-    identity: Arc<IdentityServiceImpl>,
+pub(crate) struct AppState {
+    pub(crate) identity: Arc<IdentityServiceImpl>,
     /// When false, `/mcp` is reachable from any peer without a session token
     /// (loopback development). Loopback peers are always allowed.
-    pairing_required: bool,
-    limiter: Arc<RateLimiter>,
+    pub(crate) pairing_required: bool,
+    pub(crate) limiter: Arc<RateLimiter>,
+    /// Domain services shared with the `/api/v1` handlers.
+    pub(crate) api: crate::http_api::ApiState,
+}
+
+// Lets `/api/v1` handlers extract `State<ApiState>` while the router itself
+// carries `AppState` (auth state + services).
+impl axum::extract::FromRef<AppState> for crate::http_api::ApiState {
+    fn from_ref(state: &AppState) -> Self {
+        state.api.clone()
+    }
 }
 
 /// Fixed-window per-IP request limiter (spec §7.4: rate limits for pairing
 /// and authentication attempts). One window per minute.
-struct RateLimiter {
+pub(crate) struct RateLimiter {
     limit_per_minute: u32,
     windows: std::sync::Mutex<HashMap<IpAddr, (Instant, u32)>>,
 }
 
 impl RateLimiter {
-    fn new(limit_per_minute: u32) -> Self {
+    pub(crate) fn new(limit_per_minute: u32) -> Self {
         Self {
             // A limit of 0 would lock the server out entirely; treat it as the
             // documented default instead of failing closed by accident.
@@ -1011,61 +1020,142 @@ fn is_host_peer(ip: Option<IpAddr>) -> bool {
     ip.map(|ip| ip.is_loopback()).unwrap_or(false)
 }
 
-/// Session gate for `/mcp`: rate limit every peer, then require a bearer
-/// token for non-loopback peers when pairing is enforced.
+/// Paths a remote peer may reach without a bearer token. These either expose
+/// no workspace data (`/health`, the console assets) or are required to obtain
+/// a token in the first place (`/pair/*` bootstrap).
+pub(crate) fn is_public_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/health" | "/pair/request" | "/pair/status" | "/pair/authenticate"
+    ) || path == "/ui"
+        || path.starts_with("/ui/")
+}
+
+fn bearer_token(req: &Request) -> Option<String> {
+    req.headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned)
+}
+
+/// Session gate.
+///
+/// Order is deliberate:
+/// 1. OPTIONS preflight always passes.
+/// 2. Loopback always passes (the host's own CLI and MCP clients).
+/// 3. A valid bearer token always passes — and is never rate limited.
+/// 4. Everything else is unauthenticated remote traffic: rate limit it, then
+///    allow only the bootstrap allowlist. `/api/v1/*` is gated regardless of
+///    `pairing_required`; that flag relaxes `/mcp` only.
 async fn require_session(
     State(state): State<AppState>,
     req: Request,
     next: middleware::Next,
 ) -> Response {
-    // CORS preflight never carries credentials and must not be rejected.
     if req.method() == Method::OPTIONS {
         return next.run(req).await;
     }
 
     let ip = peer_ip(&req);
-    let from_host = ip.map(|ip| ip.is_loopback()).unwrap_or(false);
+    if ip.map(|ip| ip.is_loopback()).unwrap_or(false) {
+        return next.run(req).await;
+    }
 
-    // Rate limit only remote peers: the host's own CLI must never be throttled.
-    if !from_host {
-        if let Some(ip) = ip {
-            if !state.limiter.check(ip) {
-                return json_error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "rate limit exceeded; retry in a minute",
-                );
-            }
+    let token = bearer_token(&req);
+    if let Some(token) = &token {
+        if state.identity.validate_session(token.clone()).await.is_ok() {
+            return next.run(req).await;
         }
     }
 
-    if !state.pairing_required || from_host {
+    // Unauthenticated remote traffic: brute-force protection for pairing and
+    // authentication attempts. A legitimate polling console is authenticated
+    // and never reaches this branch.
+    if let Some(ip) = ip {
+        if !state.limiter.check(ip) {
+            return json_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded; retry in a minute",
+            );
+        }
+    }
+
+    let path = req.uri().path().to_owned();
+    if is_public_path(&path) {
         return next.run(req).await;
     }
 
-    // Public liveness probe: lets a device confirm it can reach the runtime
-    // before it has a token. It exposes no workspace data.
-    if req.uri().path() == "/health" {
+    // `pairing_required = false` is the documented local-dev opt-out for /mcp
+    // only; it must never expose the management API (§7.4 Critical).
+    if path == "/mcp" && !state.pairing_required {
         return next.run(req).await;
     }
 
-    let token = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned);
-
-    let Some(token) = token else {
-        return json_error(
+    match token {
+        Some(_) => json_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired session; pair this device again",
+        ),
+        None => json_error(
             StatusCode::UNAUTHORIZED,
             "missing bearer token; pair this device (POST /pair/request) and authenticate first",
-        );
-    };
-
-    match state.identity.validate_session(token).await {
-        Ok(_device_id) => next.run(req).await,
-        Err(e) => json_error(StatusCode::UNAUTHORIZED, format!("invalid session: {e}")),
+        ),
     }
+}
+
+/// Health, pairing and device routes: everything that is *not* under `/api/v1`.
+/// `run_http_server` adds `/mcp` on top; tests use this as-is.
+pub(crate) fn base_routes() -> Router<AppState> {
+    Router::new()
+        .route("/health", axum::routing::get(health))
+        .route("/pair/request", axum::routing::post(pair_request))
+        .route("/pair/status", axum::routing::get(pair_status))
+        .route(
+            "/pair/authenticate",
+            axum::routing::post(pair_authenticate),
+        )
+        .route("/pair/approve", axum::routing::post(pair_approve))
+        .route("/pair/reject", axum::routing::post(pair_reject))
+        .route("/pair/list", axum::routing::get(pair_list))
+        .route("/device/revoke", axum::routing::post(device_revoke))
+}
+
+/// Assemble the public router: MCP + pairing routes (`base`), the versioned API,
+/// the console assets, permissive CORS, then the session gate.
+pub(crate) fn build_router(base: Router<AppState>, app_state: AppState) -> Router {
+    base.nest("/api/v1", crate::http_api::routes())
+        .merge(crate::http_api::ui::routes())
+        .with_state(app_state.clone())
+        .layer(middleware::from_fn_with_state(
+            app_state,
+            require_session,
+        ))
+        .layer(
+            CorsLayer::new()
+                .allow_methods([
+                    Method::POST,
+                    Method::GET,
+                    Method::PATCH,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers([
+                    HeaderName::from_static("content-type"),
+                    HeaderName::from_static("accept"),
+                    HeaderName::from_static("authorization"),
+                    HeaderName::from_static("mcp-session-id"),
+                    HeaderName::from_static("mcp-protocol-version"),
+                    HeaderName::from_static("last-event-id"),
+                    HeaderName::from_static("origin"),
+                ])
+                .expose_headers([
+                    HeaderName::from_static("mcp-session-id"),
+                    HeaderName::from_static("mcp-protocol-version"),
+                ])
+                .allow_origin(AllowOrigin::any())
+                .allow_credentials(false),
+        )
 }
 
 fn decode_hex(hex: &str) -> std::result::Result<Vec<u8>, String> {
@@ -1118,8 +1208,12 @@ async fn health() -> Response {
 
 /// A device asks the host for permission to pair. Returns the 6-digit code the
 /// user must read out and approve on the host.
-async fn pair_request(State(state): State<AppState>, body: axum::Json<PairRequestBody>) -> Response {
+async fn pair_request(State(state): State<AppState>, req: Request) -> Response {
     use axum::response::IntoResponse;
+    let body: PairRequestBody = match axum::Json::<PairRequestBody>::from_request(req, &state).await {
+        Ok(body) => body.0,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, e.to_string()),
+    };
     let public_key = match decode_hex(&body.public_key_hex) {
         Ok(key) if key.len() == 32 => key,
         Ok(key) => {
@@ -1174,11 +1268,13 @@ async fn pair_status(
 }
 
 /// A paired device proves key possession and receives a short-lived token.
-async fn pair_authenticate(
-    State(state): State<AppState>,
-    body: axum::Json<PairAuthenticateBody>,
-) -> Response {
+async fn pair_authenticate(State(state): State<AppState>, req: Request) -> Response {
     use axum::response::IntoResponse;
+    let body: PairAuthenticateBody =
+        match axum::Json::<PairAuthenticateBody>::from_request(req, &state).await {
+            Ok(body) => body.0,
+            Err(e) => return json_error(StatusCode::BAD_REQUEST, e.to_string()),
+        };
     let device_id = match Uuid::parse_str(&body.device_id) {
         Ok(uuid) => DeviceId(uuid),
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "device_id must be a UUID"),

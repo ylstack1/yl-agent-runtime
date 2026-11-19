@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark light" />
+  <title>YL Agent Runtime</title>
+  <link rel="stylesheet" href="/ui/app.css" />
+</head>
+<body>
+  <header id="header">
+    <div class="brand">
+      <span class="dot" id="transport-dot" aria-hidden="true"></span>
+      <strong>YL Agent Runtime</strong>
+      <span class="muted" id="version"></span>
+    </div>
+    <div class="badges">
+      <span class="badge" id="transport-badge">connecting…</span>
+      <span class="badge" id="yolo-badge" hidden>yolo</span>
+      <button class="link" id="signout" hidden>Sign out</button>
+    </div>
+  </header>
+
+  <section id="fingerprint-row" class="fingerprint" hidden>
+    <span class="muted">Certificate SHA-256</span>
+    <code id="fingerprint"></code>
+    <button class="link" id="copy-fingerprint">copy</button>
+  </section>
+
+  <nav id="tabs" hidden>
+    <button data-pane="roots" class="active">Roots</button>
+    <button data-pane="browse">Browse</button>
+    <button data-pane="workspaces">Workspaces</button>
+    <button data-pane="approvals">Approvals</button>
+    <button data-pane="devices">Devices</button>
+  </nav>
+
+  <main id="app">
+    <section id="signin">
+      <h1>Connect this browser</h1>
+      <p class="muted">
+        This console is served by <code>yl serve</code>. Pairing uses an ed25519
+        key generated in this browser; the private key never leaves it.
+      </p>
+      <button id="pair-browser" class="primary">Pair this browser</button>
+      <div id="pair-progress" class="panel" hidden></div>
+      <details class="panel">
+        <summary>Use an existing token instead</summary>
+        <p class="muted">
+          Run <code>yl pairing request</code>, approve the code with
+          <code>yl pairing approve CODE</code>, then
+          <code>yl pairing authenticate DEVICE_ID --key-hex SEED</code> and paste
+          the token here.
+        </p>
+        <form id="token-form">
+          <input id="token-input" type="password" placeholder="bearer token" autocomplete="off" />
+          <button type="submit" class="primary">Use token</button>
+        </form>
+      </details>
+      <p id="signin-error" class="error" hidden></p>
+    </section>
+
+    <section id="pane-roots" class="pane" hidden>
+      <h2>Discovery roots</h2>
+      <p class="muted">
+        Roots are the only directories this runtime may browse, register or
+        create inside. Toggles reset when <code>yl serve</code> restarts.
+      </p>
+      <div id="roots-list" class="cards"></div>
+    </section>
+
+    <section id="pane-browse" class="pane" hidden>
+      <h2>Browse</h2>
+      <div id="breadcrumb" class="breadcrumb"></div>
+      <div class="row">
+        <button id="detect-project" class="secondary">Detect project here</button>
+        <button id="register-here" class="secondary">Register this directory</button>
+        <button id="create-here" class="secondary">New project here…</button>
+      </div>
+      <div id="detect-result" class="panel" hidden></div>
+      <div id="entries" class="entries"></div>
+    </section>
+
+    <section id="pane-workspaces" class="pane" hidden>
+      <h2>Workspaces</h2>
+      <p class="muted">
+        Workspaces registered here become addressable by agents after
+        <code>yl serve</code> restarts.
+      </p>
+      <div id="workspaces-list" class="cards"></div>
+    </section>
+
+    <section id="pane-approvals" class="pane" hidden>
+      <h2>Approvals</h2>
+      <p class="muted">Pending agent requests. Approving here is the human consent.</p>
+      <div id="approvals-list" class="cards"></div>
+    </section>
+
+    <section id="pane-devices" class="pane" hidden>
+      <h2>Devices &amp; pairings</h2>
+      <p class="muted" id="devices-note"></p>
+      <div id="pairings-list" class="cards"></div>
+      <h3>Paired devices</h3>
+      <div id="devices-list" class="cards"></div>
+    </section>
+
+    <p id="toast" class="toast" hidden></p>
+  </main>
+
+  <script type="module" src="/ui/app.js"></script>
+</body>
+</html>
