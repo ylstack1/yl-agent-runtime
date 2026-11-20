@@ -3,227 +3,119 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="color-scheme" content="dark light" />
+  <meta name="color-scheme" content="dark" />
   <title>YL Agent Runtime</title>
   <link rel="stylesheet" href="/ui/app.css" />
 </head>
 <body>
-  <header id="header">
-    <div class="brand">
-      <span class="dot" id="transport-dot" aria-hidden="true"></span>
-      <strong>YL Agent Runtime</strong>
-      <span class="muted" id="version"></span>
-    </div>
-    <div class="badges">
-      <span class="badge" id="transport-badge">connecting…</span>
-      <span class="badge" id="yolo-badge" hidden>yolo</span>
-      <button class="link" id="signout" hidden>Sign out</button>
-    </div>
-  </header>
 
-  <section id="fingerprint-row" class="fingerprint" hidden>
-    <span class="muted">Certificate SHA-256</span>
-    <code id="fingerprint"></code>
-    <button class="link" id="copy-fingerprint">copy</button>
-  </section>
+  <div id="drawer-overlay" class="drawer-overlay" onclick="UI.closeDrawer()"></div>
 
-  <nav id="tabs" hidden>
-    <button data-pane="roots" class="active">Roots</button>
-    <button data-pane="browse">Browse</button>
-    <button data-pane="workspaces">Workspaces</button>
-    <button data-pane="approvals">Approvals</button>
-    <button data-pane="devices">Devices</button>
-  </nav>
+  <div class="app-shell">
+    <!-- Sidebar -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <div class="brand-title">YL Agent Runtime.</div>
+        <div class="brand-sub" id="brand-sub" title=""></div>
+      </div>
 
-  <main id="app">
-    <section id="signin">
-      <h1>Connect this browser</h1>
-      <p class="muted">
-        This console is served by <code>yl serve</code>. Pairing uses an ed25519
-        key generated in this browser; the private key never leaves it.
-      </p>
-      <button id="pair-browser" class="primary">Pair this browser</button>
-      <div id="pair-progress" class="panel" hidden></div>
-      <details class="panel">
-        <summary>Use an existing token instead</summary>
+      <div class="nav-section-label">Console</div>
+      <nav class="nav-tree" id="sidebar-nav">
+        <!-- JS Inject -->
+      </nav>
+
+      <div class="foot-info" id="foot-info"></div>
+
+      <div style="padding: 16px 24px 24px 24px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px;">
+        <button class="btn btn-secondary" style="width:100%; justify-content:center;" onclick="UI.openModal('pairing')">Pair device</button>
+        <button class="btn btn-secondary" style="width:100%; justify-content:center;" onclick="UI.openModal('settings')">Console settings</button>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main>
+      <header>
+        <button id="menu-btn" class="btn btn-secondary" onclick="UI.openDrawer()">&#9776;</button>
+        <div class="stats-strip" id="stats-strip">
+          <!-- JS Inject -->
+        </div>
+        <div style="display: flex; gap: 8px; flex-shrink: 0;">
+          <span id="transport-badge" class="badge">connecting…</span>
+          <span id="yolo-badge" class="badge warn hidden">yolo</span>
+          <button class="link" id="signout" hidden>Sign out</button>
+        </div>
+      </header>
+
+      <!-- Sign-in pane (shown when not authenticated) -->
+      <section id="signin-pane" class="signin-pane" hidden>
+        <h1>Connect this browser</h1>
         <p class="muted">
-          Run <code>yl pairing request</code>, approve the code with
-          <code>yl pairing approve CODE</code>, then
-          <code>yl pairing authenticate DEVICE_ID --key-hex SEED</code> and paste
-          the token here.
+          This console is served by <code>yl serve</code>. Pairing uses an ed25519
+          key generated in this browser; the private key never leaves it.
         </p>
-        <form id="token-form">
-          <input id="token-input" type="password" placeholder="bearer token" autocomplete="off" />
-          <button type="submit" class="primary">Use token</button>
-        </form>
-      </details>
-      <p id="signin-error" class="error" hidden></p>
-    </section>
-
-    <section id="pane-roots" class="pane" hidden>
-      <h2>Discovery roots</h2>
-      <p class="muted">
-        Roots are the only directories this runtime may browse, register or
-        create inside. Roots added here are saved and survive restarts.
-      </p>
-      <form id="add-root-form" class="panel">
-        <div class="row">
-          <label class="field"><span>Folder path</span>
-            <input id="root-path" type="text" list="root-suggestions" placeholder="C:\Users\you\Projects" required />
-            <datalist id="root-suggestions"></datalist>
-          </label>
-          <label class="field"><span>Display name</span>
-            <input id="root-label" type="text" placeholder="My Projects" />
-          </label>
-          <label class="field"><span>ID (optional)</span>
-            <input id="root-id" type="text" placeholder="projects" />
-          </label>
-        </div>
-        <div class="row">
-          <label class="toggle"><input type="checkbox" id="root-browse" checked /> browse</label>
-          <label class="toggle"><input type="checkbox" id="root-register" checked /> register</label>
-          <label class="toggle"><input type="checkbox" id="root-create" checked /> create</label>
-          <button type="submit" class="primary">Add root</button>
-        </div>
-      </form>
-      <div id="roots-list" class="cards"></div>
-    </section>
-
-    <section id="pane-browse" class="pane" hidden>
-      <h2>Browse</h2>
-      <div id="breadcrumb" class="breadcrumb"></div>
-      <div class="row">
-        <button id="detect-project" class="secondary">Detect project here</button>
-        <button id="register-here" class="secondary">Register this directory</button>
-        <button id="create-here" class="secondary">New project here…</button>
-      </div>
-      <div id="detect-result" class="panel" hidden></div>
-      <div id="entries" class="entries"></div>
-    </section>
-
-    <section id="pane-workspaces" class="pane" hidden>
-      <h2>Workspaces</h2>
-      <p class="muted">
-        Workspaces registered here become addressable by agents after
-        <code>yl serve</code> restarts.
-      </p>
-      <details class="panel">
-        <summary>New project folder…</summary>
-        <form id="create-workspace-form">
-          <div class="row">
-            <label class="field"><span>Parent root</span>
-              <select id="create-root"></select>
-            </label>
-            <label class="field"><span>Folder name</span>
-              <input id="create-name" type="text" placeholder="my-project" required />
-            </label>
-          </div>
-          <div class="row">
-            <button type="submit" class="primary">Create workspace</button>
-          </div>
-        </form>
-      </details>
-      <details class="panel">
-        <summary>Clone a git repository…</summary>
-        <form id="clone-workspace-form">
-          <div class="row">
-            <label class="field"><span>Parent root</span>
-              <select id="clone-root"></select>
-            </label>
-            <label class="field"><span>Folder name</span>
-              <input id="clone-dir" type="text" placeholder="repo (defaults from URL)" />
-            </label>
-          </div>
-          <div class="row">
-            <label class="field"><span>Git URL</span>
-              <input id="clone-url" type="text" placeholder="https://github.com/owner/repo.git" required />
-            </label>
-          </div>
-          <div class="row">
-            <button type="submit" class="primary">Clone and register</button>
-          </div>
-        </form>
-      </details>
-      <div id="workspaces-list" class="cards"></div>
-    </section>
-
-    <section id="pane-workspace-manage" class="pane" hidden>
-      <h2>Manage workspace</h2>
-      <p class="muted" id="manage-breadcrumb"></p>
-      <div class="row">
-        <button id="manage-back" class="link">← Back to workspaces</button>
-        <button id="manage-clone" class="secondary">Clone git repo into this workspace</button>
-      </div>
-
-      <section class="panel">
-        <h3>Settings</h3>
-        <form id="manage-settings-form">
-          <div class="form-row">
-            <label>Display name</label>
-            <input id="manage-display-name" type="text" />
-          </div>
-          <div class="form-row">
-            <label>Profile</label>
-            <select id="manage-profile">
-              <option value="development">development</option>
-              <option value="inspect">inspect</option>
-              <option value="edit">edit</option>
-              <option value="sandboxed-development">sandboxed_development</option>
-              <option value="elevated-one-shot">elevated_one_shot</option>
-            </select>
-          </div>
-          <div class="form-row">
-            <label>Framework hint</label>
-            <input id="manage-framework" type="text" placeholder="e.g. rust, node, python" />
-          </div>
-          <div class="form-row">
-            <label>Toolchain hint</label>
-            <input id="manage-toolchain" type="text" placeholder="e.g. stable, 18, 3.11" />
-          </div>
-          <div class="form-row">
-            <label>Allow (capability prefixes, comma-separated)</label>
-            <input id="manage-allow" type="text" placeholder="e.g. workspace.read, process.exec" />
-          </div>
-          <div class="form-row">
-            <label>Deny (capability prefixes, comma-separated)</label>
-            <input id="manage-deny" type="text" placeholder="e.g. network.direct, secrets.read" />
-          </div>
-          <button type="submit" class="primary">Save settings</button>
-        </form>
+        <button id="pair-browser" class="primary">Pair this browser</button>
+        <div id="pair-progress" class="panel" hidden></div>
+        <details class="panel">
+          <summary>Use an existing token instead</summary>
+          <p class="muted">
+            Run <code>yl pairing request</code>, approve the code with
+            <code>yl pairing approve CODE</code>, then
+            <code>yl pairing authenticate DEVICE_ID --key-hex SEED</code> and paste
+            the token here.
+          </p>
+          <form id="token-form">
+            <input id="token-input" type="password" placeholder="bearer token" autocomplete="off" />
+            <button type="submit" class="primary">Use token</button>
+          </form>
+        </details>
+        <p id="signin-error" class="error" hidden></p>
       </section>
 
-      <section class="panel">
-        <h3>Bound devices</h3>
-        <p class="muted">Devices bound to this workspace can operate within it.</p>
-        <div id="manage-devices" class="cards"></div>
-        <div class="form-row">
-          <label>Bind device id</label>
-          <input id="manage-bind-device" type="text" placeholder="device UUID" />
-          <button id="manage-bind-btn" class="secondary">Bind</button>
+      <!-- Authenticated layout -->
+      <div id="app-body" hidden>
+        <section class="toolbar">
+          <div class="search-container">
+            <span class="search-icon">&#128269;</span>
+            <input type="text" id="search-input" placeholder="Search workspaces, tags, paths…" oninput="UI.filter()" />
+          </div>
+          <select id="filter-type" onchange="UI.filter()">
+            <option value="">Type: All</option>
+          </select>
+          <select id="filter-status" onchange="UI.filter()">
+            <option value="">Status: All</option>
+          </select>
+          <select id="sort-by" onchange="UI.filter()">
+            <option value="name">Sort: Name</option>
+            <option value="recent">Sort: Recent</option>
+          </select>
+          <div class="view-toggle">
+            <button id="view-grid" class="active" onclick="UI.setView('grid')" title="Grid view">&#9632;</button>
+            <button id="view-list" onclick="UI.setView('list')" title="List view">&#9776;</button>
+          </div>
+          <span class="result-count" id="result-count"></span>
+        </section>
+
+        <div class="viewport">
+          <div class="crumb-bar" id="crumb-bar"></div>
+          <div id="grid" class="project-grid"></div>
         </div>
-      </section>
-
-      <div class="row">
-        <button id="manage-unregister" class="danger">Unregister workspace</button>
       </div>
-    </section>
+    </main>
+  </div>
 
-    <section id="pane-approvals" class="pane" hidden>
-      <h2>Approvals</h2>
-      <p class="muted">Pending agent requests. Approving here is the human consent.</p>
-      <div id="approvals-list" class="cards"></div>
-    </section>
+  <!-- Detail Side Sheet -->
+  <div id="detail-sheet" class="detail-sheet">
+    <button class="btn btn-secondary" style="margin-bottom: 32px" onclick="UI.closeDetail()">&#8592; Close</button>
+    <div id="detail-content"></div>
+  </div>
 
-    <section id="pane-devices" class="pane" hidden>
-      <h2>Devices &amp; pairings</h2>
-      <p class="muted" id="devices-note"></p>
-      <div id="pairings-list" class="cards"></div>
-      <h3>Paired devices</h3>
-      <div id="devices-list" class="cards"></div>
-    </section>
+  <!-- Modal -->
+  <div id="modal-overlay" class="modal-overlay" onclick="if(event.target===this)UI.closeModal()">
+    <div class="modal" id="modal-box"></div>
+  </div>
 
-    <p id="toast" class="toast" hidden></p>
-  </main>
+  <!-- Toast -->
+  <div id="toast-container" class="toast-container"></div>
 
   <script type="module" src="/ui/app.js"></script>
 </body>
