@@ -3,7 +3,7 @@ rem YL Agent Runtime — Admin Web Console Starter
 rem One-click: creates config if missing, starts the server, opens the admin GUI.
 rem No TOML editing, no cargo, no developer steps required.
 
-setlocal
+setlocal enabledelayedexpansion
 
 set YL_EXE=%~dp0target\debug\yl.exe
 set DATA_DIR=%LOCALAPPDATA%\yl-agent-runtime\data
@@ -31,10 +31,11 @@ start "" "%YL_EXE%" serve --allow-remote --port %PORT%
 echo [YL Admin] Waiting for server to start...
 set /a tries=0
 :wait
-curl.exe -s -o nul -w "%{http_code}" http://127.0.0.1:%PORT%/health 2>nul | findstr "200" >nul
-if %errorlevel% equ 0 goto started
+curl.exe -s -o "%TEMP%\yl-health.out" -w "%%{http_code}" http://127.0.0.1:%PORT%/health 2>nul
+set /p STATUS=<"%TEMP%\yl-health.out%"
+if "!STATUS!"=="200" goto started
 set /a tries+=1
-if %tries% geq 30 goto timeout
+if !tries! geq 30 goto timeout
 timeout /t 1 >nul
 goto wait
 
@@ -42,7 +43,8 @@ goto wait
 echo [YL Admin] Server is running at http://127.0.0.1:%PORT%
 echo [YL Admin] Opening admin console...
 start "" "http://127.0.0.1:%PORT%/ui"
-echo [YL Admin] Admin console opened. Close this window to stop the server.
+echo [YL Admin] Admin console opened.
+echo [YL Admin] Close this window to stop the server.
 goto end
 
 :timeout
@@ -103,17 +105,30 @@ echo rate_limit_per_minute = 100 >> "%1"
 echo max_request_size_mb = 10 >> "%1"
 echo. >> "%1"
 echo [workspace] >> "%1"
-echo roots = [] >> "%1"
+set ROOT_PATH=%~dp0
+set ROOT_PATH=!ROOT_PATH:\=/!
+echo roots = ["!ROOT_PATH!"] >> "%1"
 echo read_only_roots = [] >> "%1"
 echo max_file_size = 10485760 >> "%1"
 echo. >> "%1"
 echo [discovery] >> "%1"
 echo enabled = true >> "%1"
-echo default_root_id = "" >> "%1"
+echo default_root_id = "root1" >> "%1"
 echo show_hidden = false >> "%1"
 echo follow_symlinks = false >> "%1"
 echo max_depth = 12 >> "%1"
 echo max_entries_per_page = 250 >> "%1"
+echo. >> "%1"
+echo [[discovery.roots]] >> "%1"
+echo id = "root1" >> "%1"
+echo label = "Admin Workspace" >> "%1"
+echo path = "!ROOT_PATH!" >> "%1"
+echo enabled = true >> "%1"
+echo browse = true >> "%1"
+echo create = true >> "%1"
+echo register = true >> "%1"
+echo import = false >> "%1"
+echo clone = false >> "%1"
 goto :eof
 
 :end
