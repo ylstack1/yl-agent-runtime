@@ -19,7 +19,7 @@ use crate::commands::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/discovery/roots", get(list_roots))
+        .route("/discovery/roots", get(list_roots).post(add_root))
         .route("/discovery/roots/{id}", patch(toggle_root))
         .route("/discovery/roots/{id}/entries", get(browse))
         .route("/projects/detect", post(detect))
@@ -61,6 +61,45 @@ async fn list_roots(State(api): State<ApiState>) -> Response {
 #[derive(Deserialize)]
 struct ToggleBody {
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct AddRootBody {
+    id: String,
+    label: String,
+    path: String,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    browse: Option<bool>,
+    #[serde(default)]
+    create: Option<bool>,
+    #[serde(default)]
+    register: Option<bool>,
+}
+
+/// Add a new discovery root at runtime. The root path must exist on disk.
+async fn add_root(State(api): State<ApiState>, ApiJson(body): ApiJson<AddRootBody>) -> Response {
+    let path = std::path::Path::new(&body.path);
+    if !path.exists() {
+        return api_error(&Error::Validation(format!(
+            "Root path does not exist: {}",
+            body.path
+        )))
+        .into_response();
+    }
+    match api.discovery.add_root(
+        &body.id,
+        &body.label,
+        path,
+        body.enabled.unwrap_or(true),
+        body.browse.unwrap_or(true),
+        body.create.unwrap_or(false),
+        body.register.unwrap_or(false),
+    ) {
+        Ok(()) => Json(json!({ "id": body.id, "state": "added" })).into_response(),
+        Err(err) => api_error(&err).into_response(),
+    }
 }
 
 /// Enable/disable a root. Two copies exist — the browsing one and the

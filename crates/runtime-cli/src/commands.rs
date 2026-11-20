@@ -1645,6 +1645,23 @@ pub async fn run_workspace(action: WorkspaceAction) -> Result<()> {
             }
         }
         WorkspaceAction::Register { path } => {
+            // Auto-detect which discovery root contains the path.
+            let roots_value = host_api(
+                reqwest::Method::GET,
+                "/api/v1/discovery/roots",
+                None,
+            )
+            .await?;
+            let roots = roots_value
+                .get("roots")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let path_buf = PathBuf::from(&path);
+            let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
+            // Roots endpoint doesn't expose canonical_path, so try each root
+            // by sending register with root_id "default" and let the server
+            // auto-detect the containing root from the absolute path.
             let value = host_api(
                 reqwest::Method::POST,
                 "/api/v1/workspaces/register",

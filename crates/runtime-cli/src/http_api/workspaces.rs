@@ -11,7 +11,7 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use runtime_core::error::Error;
 use runtime_core::traits::WorkspaceService;
@@ -172,9 +172,39 @@ async fn register(State(api): State<ApiState>, ApiJson(body): ApiJson<RegisterBo
         Ok(profile) => profile,
         Err(err) => return api_error(&err).into_response(),
     };
-    let path = match resolve_root_path(&api, &body.root_id, &body.relative_path) {
-        Ok(path) => path,
-        Err(err) => return api_error(&err).into_response(),
+    let path = if body.root_id.is_empty() || body.root_id == "default" {
+        // Auto-detect: treat relative_path as an absolute path and find the
+        // discovery root that contains it.
+        let abs = PathBuf::from(&body.relative_path);
+        let canonical = abs.canonicalize().unwrap_or_else(|_| abs.clone());
+        let roots = api.discovery.list_roots();
+        let found = roots.iter().find(|root| {
+            canonical.starts_with(&root.canonical_path)
+        });
+        match found {
+            Some(root) => {
+                let rel = canonical
+                    .strip_prefix(&root.canonical_path)
+                    .unwrap_or(&canonical)
+                    .to_string_lossy()
+                    .to_string();
+                match resolve_root_path(&api, &root.id, &rel) {
+                    Ok(p) => p,
+                    Err(err) => return api_error(&err).into_response(),
+                }
+            }
+            None => {
+                return api_error(&Error::Validation(format!(
+                    "Path {:?} is not within any enabled discovery root", abs
+                )))
+                .into_response()
+            }
+        }
+    } else {
+        match resolve_root_path(&api, &body.root_id, &body.relative_path) {
+            Ok(p) => p,
+            Err(err) => return api_error(&err).into_response(),
+        }
     };
     let already = path
         .canonicalize()

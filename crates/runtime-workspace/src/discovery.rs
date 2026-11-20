@@ -134,6 +134,45 @@ impl DiscoveryService {
         }
     }
 
+    /// Add a new discovery root at runtime. Returns the root id.
+    pub fn add_root(
+        &self,
+        id: &str,
+        label: &str,
+        path: &Path,
+        enabled: bool,
+        browse: bool,
+        create: bool,
+        register: bool,
+    ) -> Result<()> {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let mut validator = PathValidator::new()
+            .with_root(canonical.clone())
+            .allow_symlinks(false);
+
+        let mut roots = self.roots.write().unwrap();
+        if roots.contains_key(id) {
+            return Err(Error::Validation(format!("Discovery root already exists: {id}")));
+        }
+        roots.insert(
+            id.to_string(),
+            ConfiguredRoot {
+                id: id.to_string(),
+                label: label.to_string(),
+                canonical_path: canonical,
+                enabled,
+                browse,
+                create,
+                register,
+                import: false,
+                clone: false,
+                synthetic: false,
+            },
+        );
+        self.validators.write().unwrap().insert(id.to_string(), validator);
+        Ok(())
+    }
+
     /// Return the root configuration for `id`, or error if missing/disabled.
     fn require_enabled_root(&self, id: &str) -> Result<ConfiguredRoot> {
         let roots = self.roots.read().unwrap();
