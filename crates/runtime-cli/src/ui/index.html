@@ -64,8 +64,28 @@
       <h2>Discovery roots</h2>
       <p class="muted">
         Roots are the only directories this runtime may browse, register or
-        create inside. Toggles reset when <code>yl serve</code> restarts.
+        create inside. Roots added here are saved and survive restarts.
       </p>
+      <form id="add-root-form" class="panel">
+        <div class="row">
+          <label class="field"><span>Folder path</span>
+            <input id="root-path" type="text" list="root-suggestions" placeholder="C:\Users\you\Projects" required />
+            <datalist id="root-suggestions"></datalist>
+          </label>
+          <label class="field"><span>Display name</span>
+            <input id="root-label" type="text" placeholder="My Projects" />
+          </label>
+          <label class="field"><span>ID (optional)</span>
+            <input id="root-id" type="text" placeholder="projects" />
+          </label>
+        </div>
+        <div class="row">
+          <label class="toggle"><input type="checkbox" id="root-browse" checked /> browse</label>
+          <label class="toggle"><input type="checkbox" id="root-register" checked /> register</label>
+          <label class="toggle"><input type="checkbox" id="root-create" checked /> create</label>
+          <button type="submit" class="primary">Add root</button>
+        </div>
+      </form>
       <div id="roots-list" class="cards"></div>
     </section>
 
@@ -87,10 +107,43 @@
         Workspaces registered here become addressable by agents after
         <code>yl serve</code> restarts.
       </p>
-      <div class="row">
-        <button id="new-workspace" class="primary">New workspace…</button>
-        <button id="clone-workspace" class="secondary">Clone git repo…</button>
-      </div>
+      <details class="panel">
+        <summary>New project folder…</summary>
+        <form id="create-workspace-form">
+          <div class="row">
+            <label class="field"><span>Parent root</span>
+              <select id="create-root"></select>
+            </label>
+            <label class="field"><span>Folder name</span>
+              <input id="create-name" type="text" placeholder="my-project" required />
+            </label>
+          </div>
+          <div class="row">
+            <button type="submit" class="primary">Create workspace</button>
+          </div>
+        </form>
+      </details>
+      <details class="panel">
+        <summary>Clone a git repository…</summary>
+        <form id="clone-workspace-form">
+          <div class="row">
+            <label class="field"><span>Parent root</span>
+              <select id="clone-root"></select>
+            </label>
+            <label class="field"><span>Folder name</span>
+              <input id="clone-dir" type="text" placeholder="repo (defaults from URL)" />
+            </label>
+          </div>
+          <div class="row">
+            <label class="field"><span>Git URL</span>
+              <input id="clone-url" type="text" placeholder="https://github.com/owner/repo.git" required />
+            </label>
+          </div>
+          <div class="row">
+            <button type="submit" class="primary">Clone and register</button>
+          </div>
+        </form>
+      </details>
       <div id="workspaces-list" class="cards"></div>
     </section>
 

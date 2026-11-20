@@ -597,6 +597,223 @@ fn local_lan_ip() -> Option<std::net::IpAddr> {
     sock.local_addr().ok().map(|a| a.ip())
 }
 
+/// Per-user config path used by the admin console. Kept outside the repository
+/// so a non-developer never edits files next to the source tree.
+pub fn admin_config_path() -> PathBuf {
+    if let Ok(path) = std::env::var("YL_RUNTIME_CONFIG") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(base)
+            .join("yl-agent-runtime")
+            .join("runtime.toml");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".yl-agent-runtime")
+            .join("runtime.toml");
+    }
+    PathBuf::from("runtime.toml")
+}
+
+/// Private scratch area for workspaces on a fresh install. Deliberately not
+/// the user's home directory: a default root is a writable workspace, and the
+/// operator should opt in to each directory they grant from the console.
+fn admin_workspaces_dir(config_path: &Path) -> Option<PathBuf> {
+    let dir = config_path.parent()?.join("workspaces");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Open `url` in the user's default browser, detached.
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+/// Build a per-user default config rooted in the OS application-data directory.
+fn admin_default_config(config_path: &Path) -> Config {
+    let mut config = Config::default();
+    if let Some(parent) = config_path.parent() {
+        let base = parent.to_path_buf();
+        config.data_dir = base.join("data");
+        config.config_dir = base.join("config");
+        config.log_dir = base.join("logs");
+        config.cache_dir = base.join("cache");
+        config.policy.policy_dir = base.join("config").join("policies");
+    }
+    config
+}
+
+/// Start the admin console: the one command a non-developer needs.
+///
+/// Creates a per-user config on first run, guarantees at least one workspace
+/// root so the server can start, opens `/ui`, then serves until Ctrl+C. Every
+/// action afterwards is available from the console or the CLI — this command
+/// only bootstraps the same `yl serve` engine.
+pub async fn run_admin(
+    port: u16,
+    no_open: bool,
+    loopback_only: bool,
+    yolo: bool,
+    extra_roots: Vec<String>,
+) -> Result<()> {
+    let config_path = admin_config_path();
+    let existed = config_path.exists();
+    let mut config = if existed {
+        match Config::load_from_file(&config_path) {
+            Ok(config) => config,
+            Err(err) => {
+                // A hand-edited or legacy-generated config must never brick the
+                // console. Keep a copy for inspection and regenerate defaults.
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = config_path.with_extension(format!("toml.broken-{stamp}"));
+                match std::fs::rename(&config_path, &backup) {
+                    Ok(()) => eprintln!(
+                        "[admin] config was unreadable ({err}); moved it to {} and regenerating",
+                        backup.display()
+                    ),
+                    Err(rename_err) => eprintln!(
+                        "[admin] config was unreadable ({err}) and could not be moved ({rename_err}); overwriting"
+                    ),
+                }
+                let config = admin_default_config(&config_path);
+                config.save_to_file(&config_path)?;
+                config
+            }
+        }
+    } else {
+        let config = admin_default_config(&config_path);
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        config.save_to_file(&config_path)?;
+        println!("[admin] created config: {}", config_path.display());
+        config
+    };
+
+    // A server cannot start without a root, and a stale root path (unplugged
+    // drive, deleted folder) must not brick the console. Keep only usable
+    // roots; fall back to the current directory and home when none remain.
+    if extra_roots.is_empty() {
+        let configured = std::mem::take(&mut config.workspace.roots);
+        let mut usable: Vec<PathBuf> = configured
+            .iter()
+            .filter(|path| path.exists())
+            .cloned()
+            .collect();
+        if usable.len() != configured.len() {
+            for missing in configured.iter().filter(|p| !p.exists()) {
+                eprintln!(
+                    "[admin] ignoring stale workspace root: {}",
+                    missing.display()
+                );
+            }
+        }
+        if usable.is_empty() {
+            if let Ok(cwd) = std::env::current_dir() {
+                usable.push(cwd);
+            }
+            if let Some(scratch) = admin_workspaces_dir(&config_path) {
+                if !usable.iter().any(|p| p == &scratch) {
+                    usable.push(scratch);
+                }
+            }
+        }
+        if usable.is_empty() {
+            anyhow::bail!(
+                "No usable workspace roots. Pass --root <dir> or add [workspace] roots to {}",
+                config_path.display()
+            );
+        }
+        if usable != configured {
+            println!(
+                "[admin] workspace roots: {}",
+                usable
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        config.workspace.roots = usable;
+        config.save_to_file(&config_path)?;
+    } else if !existed {
+        config.save_to_file(&config_path)?;
+    }
+
+    for dir in [
+        &config.data_dir,
+        &config.config_dir,
+        &config.log_dir,
+        &config.cache_dir,
+        &config.policy.policy_dir,
+    ] {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    std::env::set_var("YL_RUNTIME_CONFIG", &config_path);
+    if !config.workspace.roots.is_empty() && extra_roots.is_empty() {
+        // The server re-reads the config file, which now carries the roots.
+        info!("Admin config roots: {:?}", config.workspace.roots);
+    }
+
+    let console_url = format!("http://127.0.0.1:{port}/ui");
+    let health_url = format!("http://127.0.0.1:{port}/health");
+
+    println!("[admin] config:  {}", config_path.display());
+    println!("[admin] console: {console_url}");
+    if loopback_only {
+        println!("[admin] listening on loopback only (pass nothing to allow LAN/phone access)");
+    } else {
+        println!("[admin] LAN access enabled with TLS; pair a device to sign in remotely");
+    }
+    println!("[admin] stop with Ctrl+C");
+
+    if !no_open {
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            for _ in 0..120 {
+                if let Ok(resp) = client.get(&health_url).send().await {
+                    if resp.status().is_success() {
+                        open_in_browser(&console_url);
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            eprintln!("[admin] server did not answer in time; open {console_url} manually");
+        });
+    }
+
+    run_http_server(
+        "127.0.0.1".to_string(),
+        port,
+        !loopback_only,
+        yolo,
+        extra_roots,
+        false,
+    )
+    .await
+}
+
 pub async fn run_http_server(
     host: String,
     port: u16,

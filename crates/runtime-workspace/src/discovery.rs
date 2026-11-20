@@ -12,7 +12,7 @@
 use crate::path_safety::{AccessMode, PathValidator};
 use runtime_config::config::{
     DiscoveryBrowseEntry, DiscoveryBrowseResult, DiscoveryConfig, DiscoveryEntryKind,
-    DiscoveryProjectDetection,
+    DiscoveryProjectDetection, DiscoveryRoot,
 };
 use runtime_core::error::{Error, Result};
 use runtime_core::types::ProjectId;
@@ -134,42 +134,55 @@ impl DiscoveryService {
         }
     }
 
-    /// Add a new discovery root at runtime. Returns the root id.
-    pub fn add_root(
-        &self,
-        id: &str,
-        label: &str,
-        path: &Path,
-        enabled: bool,
-        browse: bool,
-        create: bool,
-        register: bool,
-    ) -> Result<()> {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let mut validator = PathValidator::new()
+    /// Add a new discovery root at runtime, from an operator-granted root
+    /// record. Keeps the browsing boundary and its validator in sync.
+    pub fn add_root(&self, root: &DiscoveryRoot) -> Result<()> {
+        let canonical = root
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| root.path.clone());
+        let validator = PathValidator::new()
             .with_root(canonical.clone())
             .allow_symlinks(false);
 
         let mut roots = self.roots.write().unwrap();
-        if roots.contains_key(id) {
-            return Err(Error::Validation(format!("Discovery root already exists: {id}")));
+        if roots.contains_key(&root.id) {
+            return Err(Error::Validation(format!(
+                "Discovery root already exists: {}",
+                root.id
+            )));
         }
         roots.insert(
-            id.to_string(),
+            root.id.clone(),
             ConfiguredRoot {
-                id: id.to_string(),
-                label: label.to_string(),
+                id: root.id.clone(),
+                label: root.label.clone(),
                 canonical_path: canonical,
-                enabled,
-                browse,
-                create,
-                register,
-                import: false,
-                clone: false,
+                enabled: root.enabled,
+                browse: root.browse,
+                create: root.create,
+                register: root.register,
+                import: root.import,
+                clone: root.clone,
                 synthetic: false,
             },
         );
-        self.validators.write().unwrap().insert(id.to_string(), validator);
+        drop(roots);
+        self.validators
+            .write()
+            .unwrap()
+            .insert(root.id.clone(), validator);
+        Ok(())
+    }
+
+    /// Remove a root again. Used to roll back a partially-applied add.
+    pub fn remove_root(&self, id: &str) -> Result<()> {
+        let mut roots = self.roots.write().unwrap();
+        if roots.remove(id).is_none() {
+            return Err(Error::Validation(format!("Discovery root not found: {id}")));
+        }
+        drop(roots);
+        self.validators.write().unwrap().remove(id);
         Ok(())
     }
 

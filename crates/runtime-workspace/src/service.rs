@@ -162,6 +162,36 @@ impl WorkspaceServiceImpl {
 
         let workspaces = Arc::new(RwLock::new(HashMap::new()));
         let validators = Arc::new(RwLock::new(HashMap::new()));
+
+        // Re-apply discovery roots added from the console in a previous run.
+        // Synthetic roots are never persisted, so this only restores operator
+        // grants and their enabled flags.
+        let roots_path = data_dir.join("discovery_roots.json");
+        let mut discovery = discovery;
+        if roots_path.exists() {
+            match std::fs::read_to_string(&roots_path) {
+                Ok(contents) => match serde_json::from_str::<Vec<DiscoveryRoot>>(&contents) {
+                    Ok(persisted) => {
+                        for root in persisted {
+                            if !discovery.roots.iter().any(|r| r.id == root.id) {
+                                discovery.roots.push(root);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err(Error::Config(format!(
+                            "Invalid discovery roots file {roots_path:?}: {e}"
+                        )))
+                    }
+                },
+                Err(e) => {
+                    return Err(Error::Config(format!(
+                        "Cannot read discovery roots file {roots_path:?}: {e}"
+                    )))
+                }
+            }
+        }
+
         let service = Self {
             workspaces: workspaces.clone(),
             validators: validators.clone(),
@@ -358,16 +388,79 @@ impl WorkspaceServiceImpl {
 
     /// Enable/disable a discovery root for enforcement (register/create). The
     /// HTTP handler calls this together with `DiscoveryService::set_root_enabled`
-    /// so browsing and registration move together. In-memory only.
+    /// so browsing and registration move together.
     pub fn set_discovery_root_enabled(&self, id: &str, enabled: bool) -> Result<()> {
-        let mut config = self.discovery.write().unwrap();
-        let root = config
+        {
+            let mut config = self.discovery.write().unwrap();
+            let root = config
+                .roots
+                .iter_mut()
+                .find(|root| root.id == id)
+                .ok_or_else(|| Error::Validation(format!("Discovery root not found: {id}")))?;
+            root.enabled = enabled;
+        }
+        self.persist_discovery_roots()
+    }
+
+    /// Add an operator-supplied discovery root. The handler calls this next to
+    /// `DiscoveryService::add_root` so registration and browsing agree on the
+    /// allowed boundary; this copy persists to `<data_dir>/discovery_roots.json`.
+    pub fn add_discovery_root(&self, root: DiscoveryRoot) -> Result<()> {
+        {
+            let mut config = self.discovery.write().unwrap();
+            if config.roots.iter().any(|existing| existing.id == root.id) {
+                return Err(Error::Validation(format!(
+                    "Discovery root already exists: {}",
+                    root.id
+                )));
+            }
+            config.roots.push(root);
+        }
+        self.persist_discovery_roots()
+    }
+
+    /// Remove an operator-supplied discovery root. Synthetic roots are derived
+    /// from `[workspace] roots` and are refused here; unregister the workspace
+    /// instead.
+    pub fn remove_discovery_root(&self, id: &str) -> Result<()> {
+        {
+            let mut config = self.discovery.write().unwrap();
+            let Some(index) = config.roots.iter().position(|root| root.id == id) else {
+                return Err(Error::Validation(format!("Discovery root not found: {id}")));
+            };
+            if config.roots[index].synthetic {
+                return Err(Error::Validation(format!(
+                    "Root {id} is derived from a workspace root; unregister the workspace instead"
+                )));
+            }
+            config.roots.remove(index);
+        }
+        self.persist_discovery_roots()
+    }
+
+    /// Write every non-synthetic root to `<data_dir>/discovery_roots.json`.
+    /// Synthetic roots are derived from workspace roots at startup and must not
+    /// be frozen into the sidecar.
+    fn persist_discovery_roots(&self) -> Result<()> {
+        let Some(data_dir) = &self.data_dir else {
+            return Ok(());
+        };
+        let roots: Vec<DiscoveryRoot> = self
+            .discovery
+            .read()
+            .unwrap()
             .roots
-            .iter_mut()
-            .find(|root| root.id == id)
-            .ok_or_else(|| Error::Validation(format!("Discovery root not found: {id}")))?;
-        root.enabled = enabled;
-        Ok(())
+            .iter()
+            .filter(|root| !root.synthetic)
+            .cloned()
+            .collect();
+        let path = data_dir.join("discovery_roots.json");
+        let json = serde_json::to_string_pretty(&roots).map_err(|e| {
+            Error::Config(format!("Cannot serialize discovery roots: {e}"))
+        })?;
+        std::fs::write(&path, json).map_err(|e| {
+            Error::Config(format!("Cannot write discovery roots {path:?}: {e}"))
+        })
     }
 
     /// Sensitive-file guard on a resolved path.

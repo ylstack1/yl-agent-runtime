@@ -318,16 +318,46 @@ struct CloneBody {
     into_subdir: String,
 }
 
+/// Derive a safe single-path-segment directory name from a git URL.
+fn clone_dir_name(git_url: &str) -> String {
+    let trimmed = git_url.trim().trim_end_matches('/');
+    let last = trimmed
+        .rsplit(['/', ':', '\\'])
+        .next()
+        .unwrap_or("clone");
+    let last = last.strip_suffix(".git").unwrap_or(last);
+    let cleaned: String = last
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    if cleaned.is_empty() {
+        "clone".to_string()
+    } else {
+        cleaned
+    }
+}
+
 async fn clone(State(api): State<ApiState>, UrlPath(id): UrlPath<String>, ApiJson(body): ApiJson<CloneBody>) -> Response {
     let project_id = match ProjectId::parse(&id) {
         Some(project_id) => project_id,
         None => return api_error(&Error::Validation("workspace id must be a UUID".into())).into_response(),
     };
-    let into_subdir = if body.into_subdir.is_empty() {
-        format!("clone-{}", &id.to_string()[..8])
+    let into_subdir = if body.into_subdir.trim().is_empty() {
+        clone_dir_name(&body.git_url)
     } else {
-        body.into_subdir
+        body.into_subdir.trim().to_string()
     };
+    // The destination must stay one segment below the workspace root.
+    if into_subdir.contains(['/', '\\'])
+        || into_subdir.contains("..")
+        || into_subdir.starts_with('.')
+        || into_subdir.is_empty()
+    {
+        return api_error(&Error::Validation(format!(
+            "Invalid destination folder name: {into_subdir}"
+        )))
+        .into_response();
+    }
     match api.fs.clone_workspace(&project_id, &body.git_url, &into_subdir).await {
         Ok(new_id) => Json(json!({
             "workspace_id": new_id,

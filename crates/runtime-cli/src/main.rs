@@ -79,6 +79,28 @@ enum Commands {
         #[arg(long)]
         insecure_http: bool,
     },
+    /// Start the admin web console (self-service: creates config on first run).
+    ///
+    /// This is the one command a non-developer needs. It creates a per-user
+    /// config if none exists, adds a default workspace root, starts the server
+    /// and opens the browser console. Everything else (roots, workspaces,
+    /// devices, approvals) is managed from that console or the CLI.
+    Admin {
+        #[arg(short, long, default_value = "8081")]
+        port: u16,
+        /// Do not open a browser window.
+        #[arg(long)]
+        no_open: bool,
+        /// Only listen on 127.0.0.1 (no LAN / phone access).
+        #[arg(long)]
+        loopback_only: bool,
+        /// Disable the approval gate (audited). Intended for automation only.
+        #[arg(long)]
+        yolo: bool,
+        /// Extra workspace root to serve (repeatable).
+        #[arg(long = "root")]
+        roots: Vec<String>,
+    },
     /// Discovery roots: list, browse, detect projects under authorized roots.
     #[command(subcommand)]
     Discovery(DiscoveryAction),
@@ -172,6 +194,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Workspace(action) => {
             commands::run_workspace(action).await?;
+        }
+        Commands::Admin {
+            port,
+            no_open,
+            loopback_only,
+            yolo,
+            roots,
+        } => {
+            commands::run_admin(port, no_open, loopback_only, yolo, roots).await?;
         }
         Commands::Approval { action } => {
             commands::run_approval(action).await?;

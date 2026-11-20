@@ -19,10 +19,48 @@ use crate::commands::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/discovery/roots", get(list_roots).post(add_root))
-        .route("/discovery/roots/{id}", patch(toggle_root))
+        .route(
+            "/discovery/roots",
+            get(list_roots).post(add_root),
+        )
+        .route("/discovery/roots/suggestions", get(root_suggestions))
+        .route("/discovery/roots/{id}", patch(toggle_root).delete(delete_root))
         .route("/discovery/roots/{id}/entries", get(browse))
         .route("/projects/detect", post(detect))
+}
+
+/// Candidate root directories an operator can grant with one click. This is a
+/// fixed suggestion list, not filesystem browsing: the response never reflects
+/// an arbitrary authenticated caller's probe, and it is only reachable through
+/// the authenticated management API.
+async fn root_suggestions() -> Response {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut push = |label: &str, path: PathBuf| {
+        if path.is_dir() && seen.insert(path.clone()) {
+            out.push(json!({ "label": label, "path": path.display().to_string() }));
+        }
+    };
+    if let Some(home) = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+    {
+        push("Home", home.clone());
+        for (name, label) in [
+            ("Desktop", "Desktop"),
+            ("Documents", "Documents"),
+            ("Downloads", "Downloads"),
+            ("Projects", "Projects"),
+            ("source", "Source"),
+            ("repos", "Repos"),
+        ] {
+            push(label, home.join(name));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        push("Current directory", cwd);
+    }
+    Json(json!({ "suggestions": out })).into_response()
 }
 
 /// Resolve a `root_id` + `relative_path` pair to an absolute host path, with
@@ -58,6 +96,35 @@ async fn list_roots(State(api): State<ApiState>) -> Response {
     Json(json!({ "roots": roots })).into_response()
 }
 
+/// Remove an operator-added root. Both copies (browsing + register/create
+/// enforcement) and the persisted sidecar are updated. Synthetic roots are
+/// refused with an explanation instead of silently reappearing.
+async fn delete_root(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
+    let roots = api.discovery.list_roots();
+    match roots.iter().find(|root| root.id == id) {
+        Some(root) if root.synthetic => {
+            return api_error(&Error::Validation(format!(
+                "Root {id} is derived from a workspace root; unregister the workspace instead"
+            )))
+            .into_response()
+        }
+        Some(_) => {}
+        None => {
+            return api_error(&Error::Validation(format!(
+                "Discovery root not found: {id}"
+            )))
+            .into_response()
+        }
+    }
+    if let Err(err) = api.discovery.remove_root(&id) {
+        return api_error(&err).into_response();
+    }
+    if let Err(err) = api.fs.remove_discovery_root(&id) {
+        return api_error(&err).into_response();
+    }
+    Json(json!({ "id": id, "state": "removed" })).into_response()
+}
+
 #[derive(Deserialize)]
 struct ToggleBody {
     enabled: bool,
@@ -78,7 +145,10 @@ struct AddRootBody {
     register: Option<bool>,
 }
 
-/// Add a new discovery root at runtime. The root path must exist on disk.
+/// Add a new discovery root at runtime. The root path must exist on disk and is
+/// persisted to `<data_dir>/discovery_roots.json`, so a console grant survives
+/// restarts. Both the browsing service and the register/create enforcement copy
+/// are updated together.
 async fn add_root(State(api): State<ApiState>, ApiJson(body): ApiJson<AddRootBody>) -> Response {
     let path = std::path::Path::new(&body.path);
     if !path.exists() {
@@ -88,18 +158,28 @@ async fn add_root(State(api): State<ApiState>, ApiJson(body): ApiJson<AddRootBod
         )))
         .into_response();
     }
-    match api.discovery.add_root(
-        &body.id,
-        &body.label,
-        path,
-        body.enabled.unwrap_or(true),
-        body.browse.unwrap_or(true),
-        body.create.unwrap_or(false),
-        body.register.unwrap_or(false),
-    ) {
-        Ok(()) => Json(json!({ "id": body.id, "state": "added" })).into_response(),
-        Err(err) => api_error(&err).into_response(),
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let root = runtime_config::config::DiscoveryRoot {
+        id: body.id.clone(),
+        label: body.label.clone(),
+        path: canonical,
+        enabled: body.enabled.unwrap_or(true),
+        browse: body.browse.unwrap_or(true),
+        create: body.create.unwrap_or(false),
+        register: body.register.unwrap_or(false),
+        import: false,
+        clone: false,
+        synthetic: false,
+    };
+    if let Err(err) = api.discovery.add_root(&root) {
+        return api_error(&err).into_response();
     }
+    if let Err(err) = api.fs.add_discovery_root(root) {
+        // Keep browsing and enforcement in sync on failure.
+        let _ = api.discovery.remove_root(&body.id);
+        return api_error(&err).into_response();
+    }
+    Json(json!({ "id": body.id, "state": "added" })).into_response()
 }
 
 /// Enable/disable a root. Two copies exist — the browsing one and the

@@ -273,8 +273,9 @@ function chip(text, on = false, extra = "") {
 async function renderRoots() {
   const { roots } = await api("/discovery/roots");
   const list = $("roots-list");
+  loadRootSuggestions().catch(() => {});
   if (!roots.length) {
-    list.innerHTML = `<div class="empty">No discovery roots. Add <code>[discovery.roots]</code> to runtime.toml.</div>`;
+    list.innerHTML = `<div class="empty">No roots yet. Add a folder above to get started.</div>`;
     return;
   }
   list.innerHTML = roots.map((root) => `
@@ -288,13 +289,14 @@ async function renderRoots() {
       </div>
       <div class="meta">
         <span><code>${esc(root.id)}</code></span>
-        ${root.synthetic ? chip("synthetic", false, "synthetic") : ""}
+        ${root.synthetic ? chip("from workspace root", false, "synthetic") : ""}
       </div>
       <div class="meta">
         ${chip("browse", root.browse)}${chip("register", root.register)}${chip("create", root.create)}${chip("import", root.import)}${chip("clone", root.clone)}
       </div>
       <div class="actions">
         <button class="secondary" data-browse-root="${esc(root.id)}" ${root.enabled && root.browse ? "" : "disabled"}>Browse</button>
+        ${root.synthetic ? "" : `<button class="danger" data-remove-root="${esc(root.id)}">Remove root</button>`}
       </div>
     </div>`).join("");
 
@@ -306,7 +308,7 @@ async function renderRoots() {
           method: "PATCH",
           body: { enabled: input.checked },
         });
-        toast(`Root ${id} ${input.checked ? "enabled" : "disabled"} (resets on restart)`);
+        toast(`Root ${id} ${input.checked ? "enabled" : "disabled"} (saved)`);
         await renderRoots();
       } catch (error) {
         input.checked = !input.checked;
@@ -319,6 +321,69 @@ async function renderRoots() {
       state.browse = { rootId: button.dataset.browseRoot, path: "" };
       showPane("browse");
     });
+  }
+  for (const button of list.querySelectorAll("[data-remove-root]")) {
+    button.addEventListener("click", async () => {
+      const id = button.dataset.removeRoot;
+      if (!confirm(`Remove root "${id}"? Workspaces already registered from it stay registered.`)) return;
+      try {
+        await api(`/discovery/roots/${encodeURIComponent(id)}`, { method: "DELETE" });
+        toast(`Root ${id} removed`);
+        await renderRoots();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    });
+  }
+}
+
+async function loadRootSuggestions() {
+  const datalist = $("root-suggestions");
+  if (!datalist || datalist.dataset.loaded) return;
+  const { suggestions } = await api("/discovery/roots/suggestions");
+  datalist.innerHTML = (suggestions || [])
+    .map((item) => `<option value="${esc(item.path)}">${esc(item.label)}</option>`)
+    .join("");
+  datalist.dataset.loaded = "1";
+}
+
+function suggestRootId(label) {
+  return String(label || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+}
+
+async function addRoot(event) {
+  event.preventDefault();
+  const path = $("root-path").value.trim();
+  if (!path) {
+    toast("Enter a folder path", true);
+    return;
+  }
+  const parts = path.replace(/[\\/]+$/, "").split(/[\\/]/);
+  const fallbackLabel = parts[parts.length - 1] || "Root";
+  const label = $("root-label").value.trim() || fallbackLabel;
+  const id = $("root-id").value.trim() || suggestRootId(label) || `root-${Date.now()}`;
+  try {
+    await api("/discovery/roots", {
+      method: "POST",
+      body: {
+        id,
+        label,
+        path,
+        enabled: true,
+        browse: $("root-browse").checked,
+        register: $("root-register").checked,
+        create: $("root-create").checked,
+      },
+    });
+    $("add-root-form").reset();
+    toast(`Root ${id} added`);
+    await renderRoots();
+  } catch (error) {
+    toast(error.message, true);
   }
 }
 
@@ -376,7 +441,12 @@ function formatSize(bytes) {
 }
 
 async function renderWorkspaces() {
-  const { workspaces } = await api("/workspaces");
+  const [{ workspaces }, { roots }] = await Promise.all([
+    api("/workspaces"),
+    api("/discovery/roots"),
+  ]);
+  fillRootSelect($("create-root"), roots);
+  fillRootSelect($("clone-root"), roots);
   const list = $("workspaces-list");
   if (!workspaces.length) {
     list.innerHTML = `<div class="empty">No workspaces registered yet.</div>`;
@@ -679,40 +749,63 @@ async function createHere() {
   }
 }
 
-async function newWorkspace() {
-  const name = prompt("New workspace name");
-  if (!name) return;
+async function newWorkspace(event) {
+  event.preventDefault();
+  const rootId = $("create-root").value;
+  const name = $("create-name").value.trim();
+  if (!rootId) return toast("Add a discovery root first", true);
+  if (!name) return toast("Enter a folder name", true);
   try {
     const result = await api("/workspaces/create", {
       method: "POST",
-      body: { root_id: "", relative_path: "", name, profile: "development" },
+      body: { root_id: rootId, relative_path: "", name, profile: "development" },
     });
-    toast("Workspace created");
+    $("create-name").value = "";
+    toast(result.already_registered ? "Folder existed — registered it" : "Workspace created");
     await renderWorkspaces();
   } catch (error) {
     toast(error.message, true);
   }
 }
 
-async function cloneWorkspace() {
-  const gitUrl = prompt("Git repository URL to clone");
-  if (!gitUrl) return;
-  const into = prompt("Clone into subdirectory name (leave empty for auto)");
+async function cloneWorkspace(event) {
+  event.preventDefault();
+  const rootId = $("clone-root").value;
+  const gitUrl = $("clone-url").value.trim();
+  const into = $("clone-dir").value.trim();
+  if (!rootId) return toast("Add a discovery root first", true);
+  if (!gitUrl) return toast("Enter a git URL", true);
+  const submit = event.target.querySelector("button[type=submit]");
+  submit.disabled = true;
+  submit.textContent = "Cloning…";
   try {
-    const result = await api("/workspaces/register", {
+    // The root itself is the parent workspace; the clone lands one level
+    // below it and is registered as its own workspace.
+    const parent = await api("/workspaces/register", {
       method: "POST",
-      body: { root_id: "", relative_path: "", name: gitUrl.split("/").pop().replace(".git", ""), profile: "development" },
+      body: { root_id: rootId, relative_path: "", profile: "development" },
     });
-    const wsId = result.workspace_id;
-    await api(`/workspaces/${encodeURIComponent(wsId)}/clone`, {
+    await api(`/workspaces/${encodeURIComponent(parent.workspace_id)}/clone`, {
       method: "POST",
-      body: { git_url: gitUrl, into_subdir: into || "" },
+      body: { git_url: gitUrl, into_subdir: into },
     });
-    toast("Workspace cloned");
+    $("clone-url").value = "";
+    $("clone-dir").value = "";
+    toast("Repository cloned and registered");
     await renderWorkspaces();
   } catch (error) {
     toast(error.message, true);
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "Clone and register";
   }
+}
+
+function fillRootSelect(select, roots) {
+  const usable = roots.filter((root) => root.enabled && root.create);
+  select.innerHTML = usable.length
+    ? usable.map((root) => `<option value="${esc(root.id)}">${esc(root.label)} (${esc(root.id)})</option>`).join("")
+    : `<option value="">No root allows create</option>`;
 }
 
 // ---- boot ---------------------------------------------------------------
@@ -751,10 +844,11 @@ function wire() {
     }
   });
   $("register-here").addEventListener("click", registerHere);
+  $("add-root-form").addEventListener("submit", addRoot);
   $("detect-project").addEventListener("click", detectHere);
   $("create-here").addEventListener("click", createHere);
-  $("new-workspace").addEventListener("click", newWorkspace);
-  $("clone-workspace").addEventListener("click", cloneWorkspace);
+  $("create-workspace-form").addEventListener("submit", newWorkspace);
+  $("clone-workspace-form").addEventListener("submit", cloneWorkspace);
   $("manage-back").addEventListener("click", () => {
     state.manageWorkspaceId = null;
     showPane("workspaces");
