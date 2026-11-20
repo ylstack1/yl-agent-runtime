@@ -134,6 +134,12 @@ fn generate(
     params.not_before = rcgen::date_time_ymd(2024, 1, 1);
     let not_after_unix = now_unix() + 10 * 365 * 24 * 60 * 60;
     params.not_after = rcgen::date_time_ymd(2034, 12, 31);
+    // Chrome requires explicit key usage + serverAuth EKU on TLS server certs.
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
 
     let key_pair = rcgen::KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
