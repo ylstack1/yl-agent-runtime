@@ -10,12 +10,14 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use ed25519_dalek::{Signature, VerifyingKey};
+use rand::RngCore;
 
 /// Identity service trait
 #[async_trait::async_trait]
 pub trait IdentityService: Send + Sync {
     async fn register_agent(&self, name: String, public_key: Vec<u8>) -> Result<AgentId>;
     async fn register_device(&self, name: String, public_key: Vec<u8>) -> Result<DeviceId>;
+    async fn create_device(&self, name: String, device_id: Option<DeviceId>) -> Result<(DeviceId, Vec<u8>)>;
     async fn get_agent(&self, id: AgentId) -> Result<AgentInfo>;
     async fn get_device(&self, id: DeviceId) -> Result<DeviceInfo>;
     async fn revoke_device(&self, id: DeviceId) -> Result<()>;
@@ -261,6 +263,17 @@ impl IdentityServiceImpl {
             .map(|b| format!("{:02x}", b))
             .collect()
     }
+
+    /// Generate an ed25519 keypair. Returns (public_key, private_key) as raw bytes.
+    pub fn generate_ed25519_keypair() -> (Vec<u8>, Vec<u8>) {
+        let mut rng = rand::thread_rng();
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let public_key = signing_key.to_bytes().to_vec();
+        let private_key = signing_key.to_bytes().to_vec();
+        (public_key, private_key)
+    }
 }
 
 #[async_trait::async_trait]
@@ -293,6 +306,26 @@ impl IdentityService for IdentityServiceImpl {
         self.devices.write().await.insert(id, device.clone());
         self.append_event(&IdentityEvent::Device { device });
         Ok(id)
+    }
+
+    /// Create a new device with a server-generated keypair.
+    /// Returns the device ID and the private key (DER-encoded, base64-encoded).
+    async fn create_device(&self, name: String, device_id: Option<DeviceId>) -> Result<(DeviceId, Vec<u8>)> {
+        let id = device_id.unwrap_or_else(DeviceId::new);
+        let (public_key, private_key) = Self::generate_ed25519_keypair();
+        let fingerprint = Self::compute_fingerprint(&public_key);
+        let device = DeviceInfo {
+            id,
+            name,
+            public_key,
+            fingerprint,
+            created_at: chrono::Utc::now(),
+            is_active: false,
+            is_revoked: false,
+        };
+        self.devices.write().await.insert(id, device.clone());
+        self.append_event(&IdentityEvent::Device { device });
+        Ok((id, private_key))
     }
 
     async fn get_agent(&self, id: AgentId) -> Result<AgentInfo> {

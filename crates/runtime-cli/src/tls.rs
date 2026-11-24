@@ -295,10 +295,12 @@ fn plan_listeners_with(
         });
     }
 
-    // Remote: loopback stays plain, every LAN address gets TLS (or plaintext
-    // only with an explicit override).
+    // Remote: loopback stays plain. Every LAN address gets TLS by default;
+    // pass --insecure-http (or set remote.allow_plaintext_lan = true) to
+    // serve plaintext HTTP on LAN instead, which works in every browser
+    // without ALPN configuration.
     plain.push(parse_addr(loopback, port)?);
-    if tls_off {
+    if tls_off || insecure {
         if !insecure {
             anyhow::bail!(
                 "refusing plaintext on a LAN interface; \
@@ -328,6 +330,10 @@ pub fn install_crypto_provider() {
 }
 
 /// Serve `app` over TLS on an already-bound listener.
+///
+/// ALPN (Application-Layer Protocol Negotiation) is required so browsers can
+/// negotiate HTTP/1.1 during the TLS handshake. Without ALPN browsers abort
+/// with `ERR_INVALID_HTTP_RESPONSE` even though the certificate is valid.
 pub async fn spawn_tls_listener(
     listener: tokio::net::TcpListener,
     app: axum::Router,

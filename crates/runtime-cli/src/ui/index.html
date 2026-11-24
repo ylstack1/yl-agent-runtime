@@ -9,7 +9,7 @@
 </head>
 <body>
 
-  <div id="drawer-overlay" class="drawer-overlay" onclick="UI.closeDrawer()"></div>
+  <div class="drawer-overlay" id="drawer-overlay" onclick="closeDrawer()"></div>
 
   <div class="app-shell">
     <!-- Sidebar -->
@@ -27,15 +27,17 @@
       <div class="foot-info" id="foot-info"></div>
 
       <div style="padding: 16px 24px 24px 24px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px;">
-        <button class="btn btn-secondary" style="width:100%; justify-content:center;" onclick="UI.openModal('pairing')">Pair device</button>
-        <button class="btn btn-secondary" style="width:100%; justify-content:center;" onclick="UI.openModal('settings')">Console settings</button>
+        <button class="btn btn-secondary" style="width:100%; justify-content:center;" onclick="openModal('pairing')">Pair device</button>
+        <button class="btn btn-secondary" style="width:100%; justify-content:center;" onclick="openAddDeviceModal()">+ Add device</button>
+        <button class="btn btn-secondary" style="width:100%; justify-content:center;" onclick="openModal('settings')">Console settings</button>
+        <button class="btn btn-secondary" style="width:100%; justify-content:center;" onclick="openModal('add-root')">Add discovery root</button>
       </div>
     </aside>
 
     <!-- Main -->
     <main>
       <header>
-        <button id="menu-btn" class="btn btn-secondary" onclick="UI.openDrawer()">&#9776;</button>
+        <button id="menu-btn" class="btn btn-secondary" onclick="openDrawer()">&#9776;</button>
         <div class="stats-strip" id="stats-strip">
           <!-- JS Inject -->
         </div>
@@ -43,10 +45,12 @@
           <span id="transport-badge" class="badge">connecting…</span>
           <span id="yolo-badge" class="badge warn hidden">yolo</span>
           <button class="link" id="signout" hidden>Sign out</button>
+          <button class="btn btn-secondary" onclick="testConnection()">Test connection</button>
+          <button class="btn btn-primary" onclick="openModal('add-root')">+ Root</button>
         </div>
       </header>
 
-      <!-- Sign-in pane (shown when not authenticated) -->
+      <!-- Sign-in pane -->
       <section id="signin-pane" class="signin-pane" hidden>
         <h1>Connect this browser</h1>
         <p class="muted">
@@ -76,23 +80,22 @@
         <section class="toolbar">
           <div class="search-container">
             <span class="search-icon">&#128269;</span>
-            <input type="text" id="search-input" placeholder="Search workspaces, tags, paths…" oninput="UI.filter()" />
+            <input type="text" id="search-input" placeholder="Search workspaces, tags, paths…" oninput="filter()" />
           </div>
-          <select id="filter-type" onchange="UI.filter()">
+          <select id="filter-type" onchange="filter()">
             <option value="">Type: All</option>
           </select>
-          <select id="filter-status" onchange="UI.filter()">
-            <option value="">Status: All</option>
-          </select>
-          <select id="sort-by" onchange="UI.filter()">
+          <select id="sort-by" onchange="setView('grid')">
             <option value="name">Sort: Name</option>
             <option value="recent">Sort: Recent</option>
           </select>
           <div class="view-toggle">
-            <button id="view-grid" class="active" onclick="UI.setView('grid')" title="Grid view">&#9632;</button>
-            <button id="view-list" onclick="UI.setView('list')" title="List view">&#9776;</button>
+            <button id="view-grid" class="active" onclick="setView('grid')" title="Grid view">&#9632;</button>
+            <button id="view-list" onclick="setView('list')" title="List view">&#9776;</button>
           </div>
           <span class="result-count" id="result-count"></span>
+          <button class="btn btn-secondary" onclick="testConnection()" title="Test connection to runtime">&#128269;</button>
+          <button class="btn btn-primary" onclick="openModal('add-root')" title="Add discovery root">+ Root</button>
         </section>
 
         <div class="viewport">
@@ -105,12 +108,12 @@
 
   <!-- Detail Side Sheet -->
   <div id="detail-sheet" class="detail-sheet">
-    <button class="btn btn-secondary" style="margin-bottom: 32px" onclick="UI.closeDetail()">&#8592; Close</button>
+    <button class="btn btn-secondary" style="margin-bottom: 32px" onclick="closeDetail()">&#8592; Close</button>
     <div id="detail-content"></div>
   </div>
 
   <!-- Modal -->
-  <div id="modal-overlay" class="modal-overlay" onclick="if(event.target===this)UI.closeModal()">
+  <div id="modal-overlay" class="modal-overlay" onclick="if(event.target===this)closeModal()">
     <div class="modal" id="modal-box"></div>
   </div>
 

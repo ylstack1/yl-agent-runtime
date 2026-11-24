@@ -86,7 +86,7 @@ enum Commands {
     /// and opens the browser console. Everything else (roots, workspaces,
     /// devices, approvals) is managed from that console or the CLI.
     Admin {
-        #[arg(short, long, default_value = "8081")]
+        #[arg(short, long, default_value = "8077")]
         port: u16,
         /// Do not open a browser window.
         #[arg(long)]

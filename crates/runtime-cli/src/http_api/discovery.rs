@@ -1,8 +1,8 @@
 //! Discovery endpoints: roots, browsing and project detection.
 //!
 //! Every path a client names is root-relative. Containment (traversal, symlink
-//! and junction escapes) is decided by `DiscoveryService`/`PathValidator`, never
-//! by string checks here.
+// and junction escapes) is decided by `DiscoveryService`/`PathValidator`, never
+// by string checks here.
 
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::response::{IntoResponse, Response};
@@ -19,10 +19,7 @@ use crate::commands::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/discovery/roots",
-            get(list_roots).post(add_root),
-        )
+        .route("/discovery/roots", get(list_roots).post(add_root))
         .route("/discovery/roots/suggestions", get(root_suggestions))
         .route("/discovery/roots/{id}", patch(toggle_root).delete(delete_root))
         .route("/discovery/roots/{id}/entries", get(browse))
@@ -200,28 +197,51 @@ async fn toggle_root(
     Json(json!({ "id": id, "enabled": body.enabled })).into_response()
 }
 
+/// Browse entries under a discovery root. Query params: `path` (root-relative),
+/// `cursor`, `limit`.
 #[derive(Deserialize)]
 struct BrowseQuery {
     #[serde(default)]
     path: String,
+    #[serde(default)]
     cursor: Option<usize>,
+    #[serde(default)]
     limit: Option<usize>,
 }
 
 async fn browse(
     State(api): State<ApiState>,
-    UrlPath(id): UrlPath<String>,
+    UrlPath(root_id): UrlPath<String>,
     Query(query): Query<BrowseQuery>,
 ) -> Response {
-    match api
-        .discovery
-        .browse_root(&id, &query.path, query.cursor, query.limit)
-    {
-        Ok(result) => Json(result).into_response(),
+    match api.discovery.browse_root(&root_id, &query.path, query.cursor, query.limit) {
+        Ok(result) => {
+            let entries: Vec<serde_json::Value> = result
+                .entries
+                .into_iter()
+                .map(|e| {
+                    json!({
+                        "name": e.name,
+                        "path": e.relative_path.to_string_lossy(),
+                        "kind": format!("{:?}", e.entry_kind),
+                        "size": e.size,
+                        "hidden": e.hidden,
+                    })
+                })
+                .collect();
+            Json(json!({
+                "root_id": result.root_id,
+                "path": result.path,
+                "entries": entries,
+                "has_more": result.has_more,
+            }))
+            .into_response()
+        }
         Err(err) => api_error(&err).into_response(),
     }
 }
 
+/// Detect a project under a discovery root. Body: { root_id, relative_path }.
 #[derive(Deserialize)]
 struct DetectBody {
     root_id: String,
@@ -229,12 +249,17 @@ struct DetectBody {
     relative_path: String,
 }
 
-async fn detect(State(api): State<ApiState>, ApiJson(body): ApiJson<DetectBody>) -> Response {
-    match api
-        .discovery
-        .detect_project(&body.root_id, &body.relative_path)
-    {
-        Ok(result) => Json(result).into_response(),
+async fn detect(State(api): State<ApiState>, Json(body): Json<DetectBody>) -> Response {
+    match api.discovery.detect_project(&body.root_id, &body.relative_path) {
+        Ok(result) => Json(serde_json::json!({
+            "root_id": result.root_id,
+            "path": result.relative_path,
+            "markers": result.markers,
+            "project_types": result.project_types,
+            "git_present": result.git_present,
+            "confidence": result.confidence,
+        }))
+        .into_response(),
         Err(err) => api_error(&err).into_response(),
     }
 }
